@@ -253,6 +253,48 @@ impl<M: Embedding> Config<M> {
         U64: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
+        let target_masks = Buffer::<M::Target>::random(
+            prover_state.rng(),
+            self.target.mask_length() * self.target.num_messages(),
+        );
+        self.prove_with_target_masks(
+            prover_state,
+            message,
+            witness,
+            claim,
+            folding_randomness,
+            mask,
+            target_masks,
+        )
+    }
+
+    /// Run code-switch with supplied randomness for the target IRS commitment.
+    ///
+    /// `target_masks` follows [`IrsConfig::commit_with_masks`]'s layout and
+    /// randomness requirements. It is distinct from `mask`, which blinds the
+    /// folded source's out-of-domain answers. Other inputs match [`Self::prove`].
+    #[allow(clippy::too_many_arguments)]
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub fn prove_with_target_masks<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        message: Buffer<M::Target>,
+        witness: IrsWitness<M::Source>,
+        claim: Claim<'_, M::Target>,
+        folding_randomness: &[M::Target],
+        mask: &[M::Target],
+        target_masks: Buffer<M::Target>,
+    ) -> Witness<M::Target>
+    where
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        Standard: Distribution<M::Target>,
+        M::Target: Codec<[H::U]>,
+        u8: Decoding<[H::U]>,
+        [u8; 32]: Decoding<[H::U]>,
+        U64: Codec<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
         let Claim { covector, sum } = claim;
         assert_eq!(message.len(), self.source.message_length());
         assert_eq!(covector.len(), self.covector_length());
@@ -266,7 +308,9 @@ impl<M: Embedding> Config<M> {
         );
 
         // Step 1: g := Enc_{C'}(f, r') — Construction 9.7 Step 1, p.55
-        let target_witness = self.target.commit(prover_state, &[&message]);
+        let target_witness = self
+            .target
+            .commit_with_masks(prover_state, &[&message], target_masks);
 
         // Grind Lemma 9.9 OOD gap before α is sampled.
         self.pow.prove(prover_state);
@@ -757,6 +801,7 @@ mod tests {
         let mut prover_state = ProverState::new_std(&ds);
         let f_full_buffer = Buffer::from(f_full.as_slice());
         let source_witness = config.source.commit(&mut prover_state, &[&f_full_buffer]);
+        let source_masks = source_witness.masks.clone();
 
         // Sample γ for sumcheck folding (length log2(ι)).
         let folding_randomness = sample_folding_randomness(config, &mut rng);
@@ -779,6 +824,37 @@ mod tests {
             &mask_msg,
         );
         let proof = prover_state.proof();
+
+        let mut supplied_state = ProverState::new_std(&ds);
+        let supplied_source =
+            config
+                .source
+                .commit_with_masks(&mut supplied_state, &[&f_full_buffer], source_masks);
+        let mut supplied_covector = verifier_covector.clone();
+        let mut supplied_sum = initial_sum;
+        let supplied_witness = config.prove_with_target_masks(
+            &mut supplied_state,
+            Buffer::from(folded_message.as_slice()),
+            supplied_source,
+            Claim {
+                covector: &mut supplied_covector,
+                sum: &mut supplied_sum,
+            },
+            &folding_randomness,
+            &mask_msg,
+            witness.target_witness.masks.clone(),
+        );
+        assert_eq!(
+            supplied_witness.target_witness.matrix,
+            witness.target_witness.matrix
+        );
+        assert_eq!(
+            supplied_witness.target_witness.masks,
+            witness.target_witness.masks
+        );
+        assert_eq!(supplied_sum, prover_sum);
+        assert_eq!(supplied_covector, covector);
+        assert_eq!(supplied_state.proof(), proof);
 
         let mut verifier_state = VerifierState::new_std(&ds, &proof);
         let source_commitment = config

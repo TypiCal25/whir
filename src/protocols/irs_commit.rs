@@ -367,6 +367,32 @@ impl<M: Embedding> Config<M> {
         M::Target: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
+        let masks = Buffer::<M::Source>::random(
+            prover_state.rng(),
+            self.mask_length() * self.num_messages(),
+        );
+        self.commit_with_masks(prover_state, vectors, masks)
+    }
+
+    /// Commit using supplied IRS randomness, taking ownership of it in the witness.
+    ///
+    /// `masks` must contain `num_messages() * mask_length()` coefficients, with
+    /// polynomial `i` at `i * mask_length()..(i + 1) * mask_length()`.
+    /// Standard mode requires an empty buffer. For hiding, the caller must supply
+    /// independent uniform randomness with the same distribution as [`Self::commit`].
+    #[cfg_attr(feature = "tracing", instrument(skip_all, fields(self = %self)))]
+    pub fn commit_with_masks<H, R>(
+        &self,
+        prover_state: &mut ProverState<H, R>,
+        vectors: &[&Buffer<M::Source>],
+        masks: Buffer<M::Source>,
+    ) -> Witness<M::Source>
+    where
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        M::Target: Codec<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
         // Validate config
         assert!((self.vector_size).is_multiple_of(self.interleaving_depth));
         assert_eq!(self.matrix_commit.num_rows(), self.codeword_length);
@@ -376,13 +402,8 @@ impl<M: Embedding> Config<M> {
         assert_eq!(vectors.len(), self.num_vectors);
         assert!(vectors.iter().all(|p| p.len() == self.vector_size));
 
-        // Sample masks in whir's canonical per-polynomial-contiguous layout:
-        // `masks[i * mask_length + c]` is polynomial `i`'s coefficient at
-        // column `c`. Downstream sites (mask_proximity discharge, code_switch
-        // fold) read masks back via this layout.
-        let mask_length = self.mask_length();
         let num_polys = self.num_messages();
-        let masks = Buffer::<M::Source>::random(prover_state.rng(), mask_length * num_polys);
+        assert_eq!(masks.len(), self.mask_length() * num_polys);
 
         let matrix = {
             let mask_buffers = [&masks];
@@ -892,6 +913,16 @@ pub(crate) mod tests {
         }
         let proof = prover_state.proof();
 
+        // Reusing the sampled masks must preserve commitment and opening bytes.
+        let mut supplied_state = ProverState::new_std(&ds);
+        let supplied_witness =
+            config.commit_with_masks(&mut supplied_state, &vector_refs, witness.masks.clone());
+        assert_eq!(supplied_witness.matrix, witness.matrix);
+        assert_eq!(supplied_witness.masks, witness.masks);
+        let supplied_evals = config.open(&mut supplied_state, &[&supplied_witness]);
+        assert_eq!(supplied_evals, in_domain_evals);
+        assert_eq!(supplied_state.proof(), proof);
+
         // Verifier
         let mut verifier_state = VerifierState::new_std(&ds, &proof);
         let commitment = config.receive_commitment(&mut verifier_state).unwrap();
@@ -928,6 +959,37 @@ pub(crate) mod tests {
         )| {
             test(seed, &config);
         });
+    }
+
+    #[test]
+    fn supplied_masks_reject_wrong_length() {
+        use proptest::{strategy::ValueTree, test_runner::TestRunner};
+
+        let mut runner = TestRunner::deterministic();
+        for mask_length in [0, 3] {
+            let config =
+                Config::arbitrary(Identity::<fields::Field64>::new(), 2, 16, mask_length, 4)
+                    .new_tree(&mut runner)
+                    .unwrap()
+                    .current();
+            let ds = DomainSeparator::protocol(&config).instance(&U64(0));
+            let vector = Buffer::from(vec![fields::Field64::ZERO; 16]);
+            let expected = config.num_messages() * mask_length;
+            for length in [expected.saturating_sub(1), expected + 1] {
+                if length == expected {
+                    continue;
+                }
+                let rejected = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut ps = ProverState::new_std(&ds);
+                    config.commit_with_masks(
+                        &mut ps,
+                        &[&vector, &vector],
+                        Buffer::from(vec![fields::Field64::ZERO; length]),
+                    )
+                }));
+                assert!(rejected.is_err());
+            }
+        }
     }
 
     #[test]
