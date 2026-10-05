@@ -323,10 +323,12 @@ struct SumcheckMaskTree<'a, F: Field> {
 }
 
 impl<'a, F: Field + Zeroize> SumcheckMaskTree<'a, F> {
-    fn sample_and_commit<H, R>(
+    /// Commit supplied mask coefficients in polynomial-contiguous order.
+    fn commit<H, R>(
         cfg: &'a MaskProximityConfig<F>,
         num_masks: usize,
         mask_poly_len: usize,
+        flat_coefficients: Vec<F>,
         ps: &mut ProverState<H, R>,
     ) -> Self
     where
@@ -336,8 +338,12 @@ impl<'a, F: Field + Zeroize> SumcheckMaskTree<'a, F> {
         Standard: Distribution<F>,
         Hash: ProverMessage<[H::U]>,
     {
+        assert_eq!(
+            flat_coefficients.len(),
+            num_masks * mask_poly_len,
+            "sumcheck mask coefficient count"
+        );
         let padded_vec_size = cfg.c_zk_commit().vector_size();
-        let flat_coefficients: Vec<F> = random_vector(ps.rng(), num_masks * mask_poly_len);
         let padded_masks: Vec<Vec<F>> = (0..num_masks)
             .map(|i| {
                 let mut padded = vec![F::ZERO; padded_vec_size];
@@ -518,8 +524,14 @@ impl<'a, F: Field + Default + Zeroize> RoundMaskOracle<'a, F> {
             SumcheckMode::ZeroKnowledge { mask_length } => mask_length.get(),
             SumcheckMode::Standard => 0,
         };
-        let sc_tree =
-            SumcheckMaskTree::sample_and_commit(mo.sumcheck_masks(), num_masks, mask_poly_len, ps);
+        let coefficients = random_vector(ps.rng(), num_masks * mask_poly_len);
+        let sc_tree = SumcheckMaskTree::commit(
+            mo.sumcheck_masks(),
+            num_masks,
+            mask_poly_len,
+            coefficients,
+            ps,
+        );
         // cs_fresh_padding is the `s` in cs_mask = (r_folded ‖ s). Sampled here because
         // it does not depend on folding randomness, preserving the Fiat–Shamir RNG ordering.
         let cs_fresh_padding_len = mo.l_zk().get() - round.code_switch().source().mask_length();
