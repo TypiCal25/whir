@@ -5,16 +5,17 @@ Both commitments use the same source configuration and transcript.
 Stage challenges can occur between them.
 
 ```rust
-let pair = JointConfig::<M>::derive(&source)?;
-let claim = pair.prove_pair(&mut prover, [left, right], forms, values)?;
-let claim = pair.verify_pair(&mut verifier, [left, right], forms, values)?;
+source.validate_pair()?;
+let claim = source.prove_pair(&mut prover, [left, right], forms, values)?;
+let claim = source.verify_pair(&mut verifier, [left, right], forms, values)?;
 claim.verify(forms)?;
 ```
 
-`JointConfig` lives in `protocols::params::joint`.
+These methods belong to the existing `ProtocolConfig`.
 Forms describe `[left | right]` and have size `2N`.
 Public data or earlier transcript messages must fix each form.
-The API binds its configuration and claim values before sampling shared coefficients.
+The API checks the source and derives the first joint round before changing the transcript.
+It binds the source configuration and claim values before sampling shared coefficients.
 The result point contains the selector first, followed by the original coordinates.
 The caller must finish with `FinalClaim::verify`.
 
@@ -41,6 +42,6 @@ cargo test --locked protocols::params::joint::tests
 cargo test --locked --test minimal_pair_rows --test minimal_pair_sumcheck --test pair_protocol
 ```
 
-Tests include `20 + 146 = 166`, `3 * 4 = 12`, and genuine extension coefficients.
+Tests include `20 + 146 = 166`, the selector polynomial, and genuine extension coefficients.
 They reject changed roots, claims, forms, dimensions, and truncated proofs.
 They also check claim binding and transcript continuation.

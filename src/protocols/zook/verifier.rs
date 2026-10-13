@@ -466,7 +466,7 @@ where
         Some((source, right)) => (source, vec![&state.irs_commitment, &right.irs_commitment]),
         None => (round.code_switch().source(), vec![&state.irs_commitment]),
     };
-    let (target_commitment, update_params) = round.code_switch().verify_with_sources(
+    let (target_commitment, update_params) = round.code_switch().verify_for_implicit(
         vs,
         &mut state.sum,
         &opening.round_challenges,

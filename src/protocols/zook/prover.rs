@@ -316,7 +316,7 @@ where
         Some((source, right)) => (source, vec![irs_witness, right]),
         None => (round.code_switch().source(), vec![irs_witness]),
     };
-    let cs_witness = round.code_switch().prove_with_sources(
+    let cs_witness = round.code_switch().prove(
         ps,
         message,
         physical_source,

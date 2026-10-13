@@ -1,61 +1,24 @@
-//! Parameters for one opening of two equal, separately committed witnesses.
-
-use serde::{Deserialize, Serialize};
-use thiserror::Error;
-
-use crate::algebra::embedding::Embedding;
+//! Add one selector fold to the first round of an existing zook configuration.
 
 use super::{
     branch::SolveMode,
     code_switch,
-    error::{DeriveError, Pow},
+    error::Pow,
     protocol_config::{ProtocolConfig, RoundConfig, RoundMode},
     spec::{FoldingFactor, Mode, RateSchedule, RoundContext},
     sumcheck,
 };
+use crate::{
+    algebra::embedding::Embedding,
+    transcript::{VerificationError, VerificationResult},
+};
 
-/// The original commitment configuration and its derived joint opening plan.
-///
-/// Both inputs use `source`. The first joint round folds the selector before
-/// the original variables. Its output and all later rounds remain unchanged.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(bound = "")]
-pub struct JointConfig<M: Embedding> {
-    source: ProtocolConfig<M>,
-    joint: ProtocolConfig<M>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Error)]
-pub enum JointConfigError {
-    #[error(
-        "joint zero-knowledge opening is unavailable until the code-switch privacy leak is fixed"
-    )]
-    ZeroKnowledgeUnavailable,
-    #[error("joint opening requires a first code-switch round")]
-    NoFirstRound,
-    #[error("joint opening requires a canonical source configuration")]
-    InvalidSource,
-    #[error("joint opening source dimensions are invalid or overflow")]
-    InvalidDimensions,
-    #[error("joint opening configuration differs from its derived plan")]
-    InvalidJoint,
-    #[error(transparent)]
-    Derive(#[from] DeriveError),
-}
-
-impl<M: Embedding + Default> JointConfig<M> {
-    /// Preserve both commitment encodings and rebuild only the first round.
-    ///
-    /// Source configurations must equal `ProtocolConfig::derive` for their
-    /// specification. This restriction also rejects malformed deserialized plans.
-    /// ZeroKnowledge mode fails until the underlying code-switch privacy leak is fixed.
-    pub fn derive(source: &ProtocolConfig<M>) -> Result<Self, JointConfigError> {
-        if source.security().mode == Mode::ZeroKnowledge {
-            return Err(JointConfigError::ZeroKnowledgeUnavailable);
-        }
-        // Bound deserialized inputs before the existing solver computes rates and sizes.
-        let tuning = source.tuning();
-        if tuning.vector_size.checked_mul(2).is_none()
+impl<M: Embedding + Default> ProtocolConfig<M> {
+    pub(crate) fn pair_config(&self) -> VerificationResult<Self> {
+        let tuning = self.tuning();
+        // Check untrusted dimensions before the parameter solver performs arithmetic.
+        if self.security().mode != Mode::Standard
+            || tuning.vector_size.checked_mul(2).is_none()
             || tuning.starting_log_inv_rate >= usize::BITS
             || matches!(
                 tuning.rate_schedule,
@@ -64,51 +27,51 @@ impl<M: Embedding + Default> JointConfig<M> {
                 }
             )
         {
-            return Err(JointConfigError::InvalidSource);
+            return Err(VerificationError);
         }
         let canonical =
-            ProtocolConfig::<M>::derive(source.security().clone(), source.tuning().clone())?;
-        if source != &canonical {
-            return Err(JointConfigError::InvalidSource);
+            Self::derive(self.security().clone(), tuning.clone()).map_err(|_| VerificationError)?;
+        if self != &canonical {
+            return Err(VerificationError);
         }
-        let first = source.first_round().ok_or(JointConfigError::NoFirstRound)?;
-        let virtual_source = first
+        let first = self.first_round().ok_or(VerificationError)?;
+        let source = first
             .code_switch()
             .source()
             .joint_pair_source()
-            .ok_or(JointConfigError::InvalidDimensions)?;
+            .ok_or(VerificationError)?;
         let context = RoundContext {
-            vector_size: virtual_source.vector_size(),
-            folding_factor: virtual_source.interleaving_depth().ilog2(),
-            log_inv_rate: source.tuning().starting_log_inv_rate,
+            vector_size: source.vector_size(),
+            folding_factor: source.interleaving_depth().ilog2(),
+            log_inv_rate: tuning.starting_log_inv_rate,
         };
-        let security = source.security();
-        let t_ood = first.code_switch().out_domain_samples();
         let sumcheck = sumcheck::solve(
-            security,
+            self.security(),
             &context,
-            &virtual_source,
+            &source,
             SolveMode::Standard,
             Pow::RoundSumcheck {
                 index: first.round_index(),
             },
-        )?;
+        )
+        .map_err(|_| VerificationError)?;
         let code_switch = code_switch::solve(
-            security,
-            virtual_source,
+            self.security(),
+            source,
             first.code_switch().target().clone(),
-            t_ood,
+            first.code_switch().out_domain_samples(),
             SolveMode::Standard,
             first.round_index(),
-        )?;
-        let mut tuning = source.tuning().clone();
+        )
+        .map_err(|_| VerificationError)?;
+        let mut tuning = tuning.clone();
         tuning.vector_size = context.vector_size;
         tuning.folding_factor = FoldingFactor::ConstantFromSecondRound {
             initial: context.folding_factor as usize,
             rest: tuning.folding_factor.at_round(1),
         };
-        let joint = ProtocolConfig::new(
-            security.clone(),
+        let pair = Self::new(
+            self.security().clone(),
             tuning,
             Some(RoundConfig::new(
                 first.round_index(),
@@ -116,31 +79,11 @@ impl<M: Embedding + Default> JointConfig<M> {
                 code_switch,
                 RoundMode::Standard,
             )),
-            source.tail_rounds().to_vec(),
-            source.basecase_plan().clone(),
+            self.tail_rounds().to_vec(),
+            self.basecase_plan().clone(),
         );
-        joint.validate()?;
-        Ok(Self {
-            source: source.clone(),
-            joint,
-        })
-    }
-
-    /// Check source integrity, complete joint derivation, security, and PoW limits.
-    pub fn validate(&self) -> Result<(), JointConfigError> {
-        let expected = Self::derive(&self.source)?;
-        if self.joint != expected.joint {
-            return Err(JointConfigError::InvalidJoint);
-        }
-        Ok(())
-    }
-
-    pub const fn source(&self) -> &ProtocolConfig<M> {
-        &self.source
-    }
-
-    pub const fn joint(&self) -> &ProtocolConfig<M> {
-        &self.joint
+        pair.validate().map_err(|_| VerificationError)?;
+        Ok(pair)
     }
 }
 
@@ -171,10 +114,9 @@ mod tests {
 
     fn check_pair<M: Embedding + Default>() {
         let source = source::<M>(Mode::Standard, 256);
-        let config = JointConfig::derive(&source).unwrap();
-        config.validate().unwrap();
+        let config = source.pair_config().unwrap();
         let original = source.first_round().unwrap();
-        let first = config.joint().first_round().unwrap();
+        let first = config.first_round().unwrap();
         let original_irs = original.code_switch().source();
         let joint_irs = first.code_switch().source();
 
@@ -196,7 +138,7 @@ mod tests {
             original_irs.in_domain_samples()
         );
         assert_eq!(joint_irs.mask_length(), original_irs.mask_length());
-        assert_eq!(joint_irs.rate(), original_irs.rate());
+        assert_eq!(joint_irs.rate().to_bits(), original_irs.rate().to_bits());
         assert_eq!(joint_irs.num_cols(), 2 * original_irs.num_cols());
 
         // The selector disappears before the unchanged target and remaining rounds.
@@ -204,12 +146,12 @@ mod tests {
             first.code_switch().target(),
             original.code_switch().target()
         );
-        assert_eq!(config.joint().tail_rounds(), source.tail_rounds());
-        assert_eq!(config.joint().basecase_plan(), source.basecase_plan());
-        assert_eq!(config.joint().security(), source.security());
-        assert_eq!(config.joint().security().target_security_bits, 128);
-        config.joint().validate_security_target_met().unwrap();
-        config.joint().validate_pow_budget().unwrap();
+        assert_eq!(config.tail_rounds(), source.tail_rounds());
+        assert_eq!(config.basecase_plan(), source.basecase_plan());
+        assert_eq!(config.security(), source.security());
+        assert_eq!(config.security().target_security_bits, 128);
+        config.validate_security_target_met().unwrap();
+        config.validate_pow_budget().unwrap();
     }
 
     #[test]
@@ -223,71 +165,45 @@ mod tests {
     }
 
     #[test]
-    fn basecase_only_source_fails_preflight() {
-        let source = source::<Identity<Field256>>(Mode::Standard, 8);
-        assert_eq!(
-            JointConfig::derive(&source),
-            Err(JointConfigError::NoFirstRound)
-        );
+    fn zero_knowledge_and_basecase_only_sources_are_rejected() {
+        assert!(source::<Identity<Field256>>(Mode::Standard, 8)
+            .validate_pair()
+            .is_err());
+        assert!(source::<Basefield<Field64_3>>(Mode::ZeroKnowledge, 256)
+            .validate_pair()
+            .is_err());
     }
 
     #[test]
-    fn changed_source_security_data_fails_preflight() {
+    fn changed_source_security_data_is_rejected() {
         let mut source = source::<Basefield<Field64_3>>(Mode::Standard, 256);
         source.corrupt_round_sumcheck_analytic_for_test(0, Bits::new(1.0));
-        assert_eq!(
-            JointConfig::derive(&source),
-            Err(JointConfigError::InvalidSource)
-        );
+        assert!(source.validate_pair().is_err());
     }
 
     #[test]
-    fn deserialized_joint_plan_must_match_its_complete_derivation() {
-        let source = source::<Basefield<Field64_3>>(Mode::Standard, 256);
-        let config = JointConfig::derive(&source).unwrap();
-        let encoded = serde_json::to_vec(&config).unwrap();
-        let mut decoded: JointConfig<Basefield<Field64_3>> =
-            serde_json::from_slice(&encoded).unwrap();
-        decoded.validate().unwrap();
-        decoded
-            .joint
-            .corrupt_round_sumcheck_analytic_for_test(0, Bits::new(1.0));
-        assert_eq!(decoded.validate(), Err(JointConfigError::InvalidJoint));
-    }
+    fn serialized_source_keeps_its_checks() {
+        type M = Basefield<Field64_3>;
+        let source = source::<M>(Mode::Standard, 256);
+        let encoded = serde_json::to_value(&source).unwrap();
+        let decoded: ProtocolConfig<M> = serde_json::from_value(encoded.clone()).unwrap();
+        decoded.validate_pair().unwrap();
 
-    #[test]
-    fn zero_knowledge_fails_preflight_until_privacy_is_fixed() {
-        let source = source::<Basefield<Field64_3>>(Mode::ZeroKnowledge, 256);
-        assert_eq!(
-            JointConfig::derive(&source),
-            Err(JointConfigError::ZeroKnowledgeUnavailable)
-        );
-    }
-
-    #[test]
-    fn deserialized_query_count_and_invalid_source_dimensions_are_rejected() {
-        let source = source::<Identity<Field256>>(Mode::Standard, 256);
-        let config = JointConfig::derive(&source).unwrap();
-
-        // Reducing the joint query count must not preserve the declared security target.
-        let mut encoded = serde_json::to_value(&config).unwrap();
-        let query_count = &mut encoded["joint"]["first_round"]["code_switch"]["config"]["source"]
-            ["in_domain_samples"];
-        assert!(query_count.as_u64().unwrap() > 1);
-        *query_count = serde_json::json!(1);
-        let decoded: JointConfig<Identity<Field256>> = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.validate(), Err(JointConfigError::InvalidJoint));
-
-        // Reject malformed source dimensions before security formulas divide by them.
-        let mut encoded = serde_json::to_value(&config).unwrap();
-        encoded["source"]["first_round"]["code_switch"]["config"]["source"]["interleaving_depth"] =
-            serde_json::json!(0);
-        let decoded: JointConfig<Identity<Field256>> = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.validate(), Err(JointConfigError::InvalidSource));
-
-        let mut encoded = serde_json::to_value(&config).unwrap();
-        encoded["source"]["tuning"]["starting_log_inv_rate"] = serde_json::json!(u32::MAX);
-        let decoded: JointConfig<Identity<Field256>> = serde_json::from_value(encoded).unwrap();
-        assert_eq!(decoded.validate(), Err(JointConfigError::InvalidSource));
+        for (pointer, value) in [
+            (
+                "/first_round/code_switch/config/source/in_domain_samples",
+                1,
+            ),
+            (
+                "/first_round/code_switch/config/source/interleaving_depth",
+                0,
+            ),
+            ("/tuning/starting_log_inv_rate", u32::MAX),
+        ] {
+            let mut malformed = encoded.clone();
+            *malformed.pointer_mut(pointer).unwrap() = serde_json::json!(value);
+            let decoded: ProtocolConfig<M> = serde_json::from_value(malformed).unwrap();
+            assert!(decoded.validate_pair().is_err(), "{pointer}");
+        }
     }
 }

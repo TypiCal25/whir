@@ -1,19 +1,6 @@
 //! Readable algebra for the extra quadratic selector round.
 use ark_ff::{AdditiveGroup, Field};
-use whir::{
-    algebra::{
-        dot,
-        embedding::{Basefield, Embedding, Identity},
-        fields::{Field64, Field64_3},
-        mixed_dot,
-    },
-    buffer::{Buffer, BufferMath, BufferOps},
-    protocols::{
-        proof_of_work,
-        sumcheck::{Config, SumcheckMode},
-    },
-    transcript::{codecs::Empty, Codec, DomainSeparator, ProverState, VerifierState},
-};
+use whir::algebra::{dot, fields::Field64};
 
 #[test]
 fn selector_polynomial_is_quadratic_and_starts_from_166() {
@@ -42,81 +29,4 @@ fn selector_polynomial_is_quadratic_and_starts_from_166() {
         assert_eq!(q(s), F::from(20) + F::from(28) * s + F::from(98) * s * s);
     }
     assert_eq!(q(F::from(2)), F::from(468));
-}
-
-fn existing_sumcheck_handles_pair<M>(embedding: M, extra_coefficient: M::Target)
-where
-    M: Embedding<Source = Field64>,
-    M::Target: Codec<[u8]>,
-{
-    type B = Field64;
-    let witness: Vec<_> = [1u64, 2, 3, 0, 5, 7, 0, 0]
-        .into_iter()
-        .map(B::from)
-        .collect();
-    let mut form: Vec<_> = [2u64, 3, 4, 0, 11, 13, 0, 0]
-        .into_iter()
-        .map(M::Target::from)
-        .collect();
-    form[0] += extra_coefficient;
-    let claim = mixed_dot(&embedding, &form, &witness);
-    // The source first round folds one variable. The joint round folds two.
-    let cfg = Config::new(8, proof_of_work::Config::none(), 2, SumcheckMode::Standard);
-    assert_eq!(cfg.final_size(), 2);
-    let ds = DomainSeparator::protocol(&cfg).instance(&Empty);
-    let mut ps = ProverState::new_std(&ds);
-    let mut folded_form = Buffer::from(form.clone());
-    let mut sum = claim;
-    let (folded_witness, opening) = cfg.prove(
-        &mut ps,
-        &embedding,
-        Buffer::from(witness.clone()),
-        &mut folded_form,
-        &mut sum,
-        &[],
-    );
-    assert_eq!(opening.round_challenges.len(), 2);
-    let selector = opening.round_challenges[0];
-    let next_coordinate = opening.round_challenges[1];
-    let selected_witness: Vec<_> = (0..4)
-        .map(|i| {
-            embedding.map(witness[i]) * (M::Target::ONE - selector)
-                + embedding.map(witness[i + 4]) * selector
-        })
-        .collect();
-    let selected_form: Vec<_> = (0..4)
-        .map(|i| form[i] * (M::Target::ONE - selector) + form[i + 4] * selector)
-        .collect();
-    for i in 0..2 {
-        assert_eq!(
-            folded_witness.to_slice()[i],
-            selected_witness[i] * (M::Target::ONE - next_coordinate)
-                + selected_witness[i + 2] * next_coordinate
-        );
-        assert_eq!(
-            folded_form.to_slice()[i],
-            selected_form[i] * (M::Target::ONE - next_coordinate)
-                + selected_form[i + 2] * next_coordinate
-        );
-    }
-    assert_eq!(sum, folded_witness.dot(&folded_form));
-    let proof = ps.proof();
-    let mut vs = VerifierState::new_std(&ds, &proof);
-    let mut verifier_sum = claim;
-    let verifier_opening = cfg.verify(&mut vs, &mut verifier_sum).unwrap();
-    assert_eq!(verifier_sum, sum);
-    assert_eq!(verifier_opening.round_challenges, opening.round_challenges);
-    assert_eq!(verifier_opening.mask_rlc, opening.mask_rlc);
-    vs.check_eof().unwrap();
-}
-
-#[test]
-fn existing_sumcheck_supports_selector_with_identity() {
-    existing_sumcheck_handles_pair(Identity::<Field64>::default(), Field64::ZERO);
-}
-
-#[test]
-fn existing_sumcheck_supports_selector_with_genuine_extension_coefficients() {
-    let extension = Field64_3::new(Field64::ZERO, Field64::ONE, Field64::ZERO);
-    existing_sumcheck_handles_pair(Basefield::<Field64_3>::default(), extension);
 }

@@ -71,8 +71,7 @@ pub type Commitment = IrsCommitment;
 
 /// Code-switch verification output for implicit-covector callers.
 ///
-/// Returned by [`Config::verify_for_implicit`]. The caller accumulates
-/// constraint terms from these instead of updating an explicit `Vec<F>`.
+/// The caller accumulates constraint terms instead of updating an explicit `Vec<F>`.
 #[must_use]
 pub struct CovectorUpdateParams<F: Field> {
     /// The `original_sl_coeff` that would have scaled the covector.
@@ -233,41 +232,9 @@ impl<M: Embedding> Config<M> {
     /// `mask` is `(r || s)` from the orchestrator's shared mask tree
     /// (see Construction 9.7 Step 1, p.55). Length must equal
     /// `self.message_mask_length()` — pass an empty slice in Standard mode.
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn prove<H, R>(
-        &self,
-        prover_state: &mut ProverState<H, R>,
-        message: Buffer<M::Target>,
-        witness: IrsWitness<M::Source>,
-        claim: Claim<'_, M::Target>,
-        folding_randomness: &[M::Target],
-        mask: &[M::Target],
-    ) -> Witness<M::Target>
-    where
-        H: DuplexSpongeInterface,
-        R: RngCore + CryptoRng,
-        Standard: Distribution<M::Target>,
-        M::Target: Codec<[H::U]>,
-        u8: Decoding<[H::U]>,
-        [u8; 32]: Decoding<[H::U]>,
-        U64: Codec<[H::U]>,
-        Hash: ProverMessage<[H::U]>,
-    {
-        self.prove_with_sources(
-            prover_state,
-            message,
-            &self.source,
-            vec![witness],
-            claim,
-            folding_randomness,
-            mask,
-        )
-    }
-
-    /// Open existing source trees as the columns of one virtual source.
-    /// Only the paired ZO0K entry point supplies more than one tree.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn prove_with_sources<H, R>(
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub(crate) fn prove<H, R>(
         &self,
         prover_state: &mut ProverState<H, R>,
         message: Buffer<M::Target>,
@@ -454,7 +421,8 @@ impl<M: Embedding> Config<M> {
     /// Shared transcript work: receive target commitment, verify source opening,
     /// sample batching coefficients, update `sum`. Returns the target commitment
     /// and the parameters needed to update a covector (explicitly or implicitly).
-    pub(crate) fn verify_with_sources<H>(
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub(crate) fn verify_for_implicit<H>(
         &self,
         verifier_state: &mut VerifierState<H>,
         sum: &mut M::Target,
@@ -545,7 +513,7 @@ impl<M: Embedding> Config<M> {
         verify!(1 << folding_randomness.len() == self.source.interleaving_depth());
         assert_eq!(covector.len(), self.covector_length());
 
-        let (target_commitment, params) = self.verify_with_sources(
+        let (target_commitment, params) = self.verify_for_implicit(
             verifier_state,
             sum,
             folding_randomness,
@@ -565,37 +533,6 @@ impl<M: Embedding> Config<M> {
         );
 
         Ok(target_commitment)
-    }
-
-    /// Like [`verify`] but does NOT update an explicit covector. Instead it
-    /// returns [`CovectorUpdateParams`] so the caller can accumulate constraint
-    /// terms implicitly. Also does NOT assert `covector.len() == covector_length()`
-    /// since there is no covector. The `sum` is still updated as normal.
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn verify_for_implicit<H>(
-        &self,
-        verifier_state: &mut VerifierState<H>,
-        sum: &mut M::Target,
-        folding_randomness: &[M::Target],
-        commitment: &IrsCommitment,
-    ) -> VerificationResult<(Commitment, CovectorUpdateParams<M::Target>)>
-    where
-        H: DuplexSpongeInterface,
-        Standard: Distribution<M::Target>,
-        M::Target: Codec<[H::U]>,
-        u8: Decoding<[H::U]>,
-        [u8; 32]: Decoding<[H::U]>,
-        U64: Codec<[H::U]>,
-        Hash: ProverMessage<[H::U]>,
-    {
-        verify!(1 << folding_randomness.len() == self.source.interleaving_depth());
-        self.verify_with_sources(
-            verifier_state,
-            sum,
-            folding_randomness,
-            &self.source,
-            &[commitment],
-        )
     }
 }
 
@@ -830,7 +767,8 @@ mod tests {
         let witness = config.prove(
             &mut prover_state,
             folded_message_buffer,
-            source_witness,
+            &config.source,
+            vec![source_witness],
             Claim {
                 covector: &mut covector,
                 sum: &mut prover_sum,
@@ -906,7 +844,8 @@ mod tests {
         let _witness = config.prove(
             &mut prover_state,
             folded_message,
-            source_witness,
+            &config.source,
+            vec![source_witness],
             Claim {
                 covector: &mut covector,
                 sum: &mut prover_sum,
@@ -973,7 +912,8 @@ mod tests {
         let _witness = config.prove(
             &mut prover_state,
             tampered,
-            source_witness,
+            &config.source,
+            vec![source_witness],
             Claim {
                 covector: &mut covector,
                 sum: &mut prover_sum,

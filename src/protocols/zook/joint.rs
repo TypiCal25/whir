@@ -1,85 +1,64 @@
-//! One selector fold joins two existing, equally sized commitments.
+//! Open two existing commitments with one leading selector coordinate.
 //!
-//! The caller commits the first witness, samples its stage challenges, and then
-//! commits the second witness through `JointConfig::source`. Both commitments
-//! must use the same transcript as this opening. Forms describe `[left | right]`.
-//! Their meaning must be fixed by the public statement or earlier transcript.
-//! This entry point binds the configuration and every value before sampling the
-//! shared claim coefficients. The caller must finish with `FinalClaim::verify`.
+//! Both commitments use this source configuration and the same transcript.
+//! Forms describe `[left | right]` and are fixed before the opening begins.
+//! Claim values are bound before sampling the shared batching challenge.
 
 use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, RngCore};
-use thiserror::Error;
 use zeroize::Zeroize;
 
-use super::{commit::CommittedState, Commitment, CommittedWitness, FinalClaim, ProverClaim};
+use super::{
+    commit::CommittedState, Commitment, CommittedWitness, FinalClaim, ProtocolConfig, ProverClaim,
+};
 use crate::{
     algebra::{embedding::Embedding, linear_form::LinearForm},
     buffer::BufferOps,
     hash::Hash,
-    protocols::params::{joint::JointConfig, spec::Mode},
     transcript::{
         codecs::U64, Codec, Decoding, DuplexSpongeInterface, ProverMessage, ProverState,
-        VerifierState,
+        VerificationError, VerificationResult, VerifierState,
     },
 };
 
-/// Failure before or during the paired opening.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
-pub enum JointOpeningError {
-    #[error("invalid joint configuration")]
-    InvalidConfiguration,
-    #[error("joint zero knowledge is unavailable: the existing mask reconciliation reveals an unclaimed witness evaluation")]
-    UnsupportedZeroKnowledge,
-    #[error("joint opening requires nonempty matching claims with size 2N")]
-    InvalidClaims,
-    #[error("joint opening requires two N-entry round commitments")]
-    InvalidWitness,
-    #[error("invalid joint opening proof")]
-    InvalidProof,
-}
+impl<M: Embedding + Default> ProtocolConfig<M> {
+    /// Check pair support before committing. Only Standard mode with rounds is supported.
+    pub fn validate_pair(&self) -> VerificationResult<()> {
+        self.pair_config().map(|_| ())
+    }
 
-impl<M: Embedding + Default> JointConfig<M> {
-    fn check_opening(
+    fn pair_opening_config(
         &self,
         forms: &[&dyn LinearForm<M::Target>],
         values: &[M::Target],
-    ) -> Result<(), JointOpeningError> {
-        // Fail closed before writing or reading any transcript data.
-        if self.source().security().mode == Mode::ZeroKnowledge {
-            return Err(JointOpeningError::UnsupportedZeroKnowledge);
-        }
-        self.validate()
-            .map_err(|_| JointOpeningError::InvalidConfiguration)?;
+    ) -> VerificationResult<Self> {
+        let pair = self.pair_config()?;
         if forms.is_empty()
             || forms.len() != values.len()
             || forms
                 .iter()
-                .any(|form| form.size() != self.joint().tuning().vector_size)
+                .any(|form| form.size() != pair.tuning().vector_size)
         {
-            return Err(JointOpeningError::InvalidClaims);
+            return Err(VerificationError);
         }
-        Ok(())
+        Ok(pair)
     }
 
-    fn opening_binding(&self) -> Hash {
+    fn pair_binding(&self) -> Hash {
         let mut digest = blake3::Hasher::new();
-        digest.update(b"whir-joint-two-witness-v1");
-        digest.update(&serde_json::to_vec(self).expect("joint configuration serializes"));
+        digest.update(b"zook-pair-v1");
+        digest.update(&serde_json::to_vec(self).expect("source configuration serializes"));
         Hash(*digest.finalize().as_bytes())
     }
 
-    /// Prove combined claims for two existing source commitments.
-    ///
-    /// The first result coordinate is the selector. Remaining coordinates belong
-    /// to each original witness. This method leaves later transcript messages alone.
-    /// ZeroKnowledge mode fails before any transcript mutation.
+    /// Prove forms over `[left | right]`. The result point starts with the selector.
+    /// Invalid parameters, claims, or handles fail before the transcript changes.
     pub fn prove_pair<H, R>(
         &self,
         ps: &mut ProverState<H, R>,
         committed: [CommittedWitness<M>; 2],
         forms: &[&dyn LinearForm<M::Target>],
         values: &[M::Target],
-    ) -> Result<ProverClaim<M::Target>, JointOpeningError>
+    ) -> VerificationResult<ProverClaim<M::Target>>
     where
         M::Target: Default + Zeroize + Codec<[H::U]>,
         Standard: Distribution<M::Target>,
@@ -90,9 +69,8 @@ impl<M: Embedding + Default> JointConfig<M> {
         U64: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
-        self.check_opening(forms, values)?;
+        let pair = self.pair_opening_config(forms, values)?;
         let source = self
-            .source()
             .first_round()
             .expect("validated first round")
             .code_switch()
@@ -106,30 +84,23 @@ impl<M: Embedding + Default> JointConfig<M> {
                     && irs_witness.matrix_witness.num_nodes()
                         == source.matrix_commit().merkle_tree.num_nodes())
         }) {
-            return Err(JointOpeningError::InvalidWitness);
+            return Err(VerificationError);
         }
-        // Values precede gamma even when the caller has not sent them already.
-        ps.prover_message(&self.opening_binding());
+        ps.prover_message(&self.pair_binding());
         ps.prover_message(&U64(values.len() as u64));
-        for value in values {
-            ps.prover_message(value);
-        }
+        ps.prover_messages(values);
         let [left, right] = committed;
-        Ok(self
-            .joint()
-            .prove_with_second(ps, left, Some((source, right)), forms, values))
+        Ok(pair.prove_with_second(ps, left, Some((source, right)), forms, values))
     }
 
-    /// Verify the joint transcript and return the final form check.
-    ///
-    /// The caller must call `FinalClaim::verify(forms)` before accepting the proof.
+    /// Verify the pair opening. The caller must finish with `FinalClaim::verify(forms)`.
     pub fn verify_pair<H>(
         &self,
         vs: &mut VerifierState<H>,
         commitments: [Commitment; 2],
         forms: &[&dyn LinearForm<M::Target>],
         values: &[M::Target],
-    ) -> Result<FinalClaim<M::Target>, JointOpeningError>
+    ) -> VerificationResult<FinalClaim<M::Target>>
     where
         M::Target: Default + Codec<[H::U]>,
         Standard: Distribution<M::Target>,
@@ -139,33 +110,23 @@ impl<M: Embedding + Default> JointConfig<M> {
         U64: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
-        self.check_opening(forms, values)?;
-        let binding: Hash = vs
-            .prover_message()
-            .map_err(|_| JointOpeningError::InvalidProof)?;
-        let count: U64 = vs
-            .prover_message()
-            .map_err(|_| JointOpeningError::InvalidProof)?;
-        if binding != self.opening_binding() || count.0 != values.len() as u64 {
-            return Err(JointOpeningError::InvalidProof);
+        let pair = self.pair_opening_config(forms, values)?;
+        let binding: Hash = vs.prover_message()?;
+        let count: U64 = vs.prover_message()?;
+        if binding != self.pair_binding() || count.0 != values.len() as u64 {
+            return Err(VerificationError);
         }
         for expected in values {
-            let actual: M::Target = vs
-                .prover_message()
-                .map_err(|_| JointOpeningError::InvalidProof)?;
-            if actual != *expected {
-                return Err(JointOpeningError::InvalidProof);
+            if vs.prover_message::<M::Target>()? != *expected {
+                return Err(VerificationError);
             }
         }
         let [left, right] = commitments;
         let source = self
-            .source()
             .first_round()
             .expect("validated first round")
             .code_switch()
             .source();
-        self.joint()
-            .verify_with_second(vs, left, Some((source, &right)), forms, values)
-            .map_err(|_| JointOpeningError::InvalidProof)
+        pair.verify_with_second(vs, left, Some((source, &right)), forms, values)
     }
 }
