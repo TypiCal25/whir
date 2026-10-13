@@ -296,9 +296,12 @@ where
 
     // Build cs_mask = (folded_irs_masks ‖ cs_fresh_padding), commit its tree,
     // send mask_eval_sum cleartext, reconcile sum to the unmasked dot.
+    let pair_masks = second
+        .as_ref()
+        .map(|(_, right)| irs_witness.masks.concat(&right.masks));
     masker.bind_code_switch_mask(
         round.code_switch().source().embedding(),
-        &irs_witness,
+        pair_masks.as_ref().unwrap_or(&irs_witness.masks),
         &opening,
         &mut sum,
         ps,
@@ -585,7 +588,7 @@ impl<'a, F: Field + Default + Zeroize> RoundMaskOracle<'a, F> {
     fn bind_code_switch_mask<M, H, R>(
         &mut self,
         embedding: &M,
-        irs_witness: &IrsWitness<M::Source>,
+        source_masks: &Buffer<M::Source>,
         opening: &SumcheckOpening<F>,
         sum: &mut F,
         ps: &mut ProverState<H, R>,
@@ -618,7 +621,7 @@ impl<'a, F: Field + Default + Zeroize> RoundMaskOracle<'a, F> {
         let source_mask_len = mask_oracle.l_zk().get() - cs_fresh_padding.len();
         let r_folded = mixed_fold_chunks(
             embedding,
-            irs_witness.masks.to_slice(),
+            source_masks.to_slice(),
             source_mask_len,
             &opening.round_challenges,
         );

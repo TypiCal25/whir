@@ -49,13 +49,14 @@ struct Example<M: Embedding> {
     stage_challenge: M::Target,
 }
 
-fn prove_example<M>(extension_coefficient: M::Target) -> Example<M>
+fn prove_example<M>(mode: Mode, extension_coefficient: M::Target) -> Example<M>
 where
     M: Embedding + Default,
     M::Target: Default + Zeroize + Codec,
     Standard: Distribution<M::Source> + Distribution<M::Target>,
 {
-    let config = source::<M>(Mode::Standard);
+    let config: ProtocolConfig<M> =
+        serde_json::from_value(serde_json::to_value(source::<M>(mode)).unwrap()).unwrap();
     let n = config.tuning().vector_size;
     let mut left = vec![M::Source::ZERO; n];
     let mut right = left.clone();
@@ -165,177 +166,167 @@ where
 
 #[test]
 fn hand_calculated_claims_use_both_existing_commitments_at_128_bits() {
-    let example = prove_example::<Identity<Field256>>(Field256::from(19));
-    verify_example(&example, Change::None).unwrap();
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let example = prove_example::<Identity<Field256>>(mode, Field256::from(19));
+        verify_example(&example, Change::None).unwrap();
+    }
 }
 
 #[test]
 fn genuine_extension_coefficients_open_base_field_witnesses_at_128_bits() {
     let e = Field64_3::new(2u64.into(), 3u64.into(), 5u64.into());
     assert_ne!(e, Field64_3::from(2));
-    let example = prove_example::<Basefield<Field64_3>>(e);
-    assert_ne!(example.values[1], Field64_3::from(16));
-    verify_example(&example, Change::None).unwrap();
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let example = prove_example::<Basefield<Field64_3>>(mode, e);
+        assert_ne!(example.values[1], Field64_3::from(16));
+        verify_example(&example, Change::None).unwrap();
+    }
 }
 
 #[test]
 fn changed_roots_claim_values_and_final_forms_are_rejected() {
-    let example = prove_example::<Identity<Field256>>(Field256::from(19));
-    for change in [
-        Change::SwapRoots,
-        Change::LeftRoot,
-        Change::RightRoot,
-        Change::Claim,
-        Change::Form,
-    ] {
-        // The debug feature deliberately panics when verification rejects a proof.
-        #[cfg(feature = "verifier_panics")]
-        let rejected = std::panic::catch_unwind(|| verify_example(&example, change))
-            .map_or(true, |result| result.is_err());
-        #[cfg(not(feature = "verifier_panics"))]
-        let rejected = verify_example(&example, change).is_err();
-        assert!(rejected, "{change:?} must fail");
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let example = prove_example::<Identity<Field256>>(mode, Field256::from(19));
+        for change in [
+            Change::SwapRoots,
+            Change::LeftRoot,
+            Change::RightRoot,
+            Change::Claim,
+            Change::Form,
+        ] {
+            // The debug feature deliberately panics when verification rejects a proof.
+            #[cfg(feature = "verifier_panics")]
+            let rejected = std::panic::catch_unwind(|| verify_example(&example, change))
+                .map_or(true, |result| result.is_err());
+            #[cfg(not(feature = "verifier_panics"))]
+            let rejected = verify_example(&example, change).is_err();
+            assert!(rejected, "{mode:?}: {change:?} must fail");
+        }
     }
 }
 
 #[test]
 fn truncated_joint_proofs_are_rejected() {
-    let mut example = prove_example::<Identity<Field256>>(Field256::from(19));
-    example
-        .proof
-        .narg_string
-        .truncate(example.proof.narg_string.len() / 2);
-    assert!(verify_example(&example, Change::None).is_err());
-}
-
-#[test]
-fn zero_knowledge_execution_fails_before_transcript_mutation() {
-    type M = Identity<Field256>;
-    let zk = source::<M>(Mode::ZeroKnowledge);
-    let config: ProtocolConfig<M> =
-        serde_json::from_value(serde_json::to_value(&zk).unwrap()).unwrap();
-    let ds = DomainSeparator::protocol(&"zero-knowledge-closed").instance(&Empty);
-    let mut ps = ProverState::new_std(&ds);
-    let left = zk.commit(&mut ps, Buffer::from(vec![Field256::ZERO; 256]));
-    let right = zk.commit(&mut ps, Buffer::from(vec![Field256::ZERO; 256]));
-    let form = Covector::new(vec![Field256::ZERO; 512]);
-    assert!(config
-        .prove_pair(&mut ps, [left, right], &[&form], &[Field256::ZERO])
-        .is_err());
-    ps.prover_message(&Field256::from(987));
-    let proof = ps.proof();
-    let mut vs = VerifierState::new_std(&ds, &proof);
-    let left = zk.receive_commitment(&mut vs).unwrap();
-    let right = zk.receive_commitment(&mut vs).unwrap();
-    assert!(config
-        .verify_pair(&mut vs, [left, right], &[&form], &[Field256::ZERO])
-        .is_err());
-    let sentinel: Field256 = vs.prover_message().unwrap();
-    assert_eq!(sentinel, Field256::from(987));
-    vs.check_eof().unwrap();
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let mut example = prove_example::<Identity<Field256>>(mode, Field256::from(19));
+        example
+            .proof
+            .narg_string
+            .truncate(example.proof.narg_string.len() / 2);
+        assert!(verify_example(&example, Change::None).is_err());
+    }
 }
 
 #[test]
 fn all_claim_values_precede_the_shared_batching_challenge() {
     type F = Field256;
-    let example = prove_example::<Identity<F>>(F::from(19));
-    let ds = DomainSeparator::protocol(&"two-witness-examples").instance(&Empty);
-    let mut observer = VerifierState::new_std(&ds, &example.proof);
-    let _ = example.config.receive_commitment(&mut observer).unwrap();
-    let _: F = observer.verifier_message();
-    let _ = example.config.receive_commitment(&mut observer).unwrap();
-    let _: hash::Hash = observer.prover_message().unwrap();
-    let count: whir::transcript::codecs::U64 = observer.prover_message().unwrap();
-    assert_eq!(count.0 as usize, example.values.len());
-    for expected in &example.values {
-        let bound_value: F = observer.prover_message().unwrap();
-        assert_eq!(&bound_value, expected);
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let example = prove_example::<Identity<F>>(mode, F::from(19));
+        let ds = DomainSeparator::protocol(&"two-witness-examples").instance(&Empty);
+        let mut observer = VerifierState::new_std(&ds, &example.proof);
+        let _ = example.config.receive_commitment(&mut observer).unwrap();
+        let _: F = observer.verifier_message();
+        let _ = example.config.receive_commitment(&mut observer).unwrap();
+        let _: hash::Hash = observer.prover_message().unwrap();
+        let count: whir::transcript::codecs::U64 = observer.prover_message().unwrap();
+        assert_eq!(count.0 as usize, example.values.len());
+        for expected in &example.values {
+            let bound_value: F = observer.prover_message().unwrap();
+            assert_eq!(&bound_value, expected);
+        }
+        let gamma: F = observer.verifier_message();
+        assert_eq!(example.result.rlc_coefficients[0], F::ONE);
+        assert_eq!(example.result.rlc_coefficients[1], gamma);
+        assert_eq!(example.result.rlc_coefficients[2], gamma * gamma);
     }
-    let gamma: F = observer.verifier_message();
-    assert_eq!(example.result.rlc_coefficients[0], F::ONE);
-    assert_eq!(example.result.rlc_coefficients[1], gamma);
-    assert_eq!(example.result.rlc_coefficients[2], gamma * gamma);
 }
 
 #[test]
 fn malformed_claim_dimensions_fail_before_transcript_mutation() {
     type F = Field256;
     type ClaimInput<'a> = (&'a [&'a dyn LinearForm<F>], &'a [F]);
-    let config = source::<Identity<F>>(Mode::Standard);
-    let ds = DomainSeparator::protocol(&"pair-shape-checks").instance(&Empty);
-    let mut ps = ProverState::new_std(&ds);
-    let committed = [
-        config.commit(&mut ps, Buffer::from(vec![F::ONE; 256])),
-        config.commit(&mut ps, Buffer::from(vec![F::ONE; 256])),
-    ];
-    let form = Covector::new(vec![F::ZERO; 512]);
-    let short = Covector::new(vec![F::ZERO; 256]);
-    let malformed: [ClaimInput<'_>; 3] = [(&[], &[]), (&[&form], &[]), (&[&short], &[F::ZERO])];
-    for (forms, values) in malformed {
-        assert!(config
-            .prove_pair(&mut ps, committed.clone(), forms, values)
-            .is_err());
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let config = source::<Identity<F>>(mode);
+        let ds = DomainSeparator::protocol(&"pair-shape-checks").instance(&Empty);
+        let mut ps = ProverState::new_std(&ds);
+        let committed = [
+            config.commit(&mut ps, Buffer::from(vec![F::ONE; 256])),
+            config.commit(&mut ps, Buffer::from(vec![F::ONE; 256])),
+        ];
+        let form = Covector::new(vec![F::ZERO; 512]);
+        let short = Covector::new(vec![F::ZERO; 256]);
+        let malformed: [ClaimInput<'_>; 3] = [(&[], &[]), (&[&form], &[]), (&[&short], &[F::ZERO])];
+        for (forms, values) in malformed {
+            assert!(config
+                .prove_pair(&mut ps, committed.clone(), forms, values)
+                .is_err());
+        }
+        config
+            .prove_pair(&mut ps, committed, &[&form], &[F::ZERO])
+            .unwrap();
+        let proof = ps.proof();
+        let mut vs = VerifierState::new_std(&ds, &proof);
+        let commitments = [
+            config.receive_commitment(&mut vs).unwrap(),
+            config.receive_commitment(&mut vs).unwrap(),
+        ];
+        for (forms, values) in malformed {
+            assert!(config
+                .verify_pair(&mut vs, commitments.clone(), forms, values)
+                .is_err());
+        }
+        config
+            .verify_pair(&mut vs, commitments, &[&form], &[F::ZERO])
+            .unwrap()
+            .verify(&[&form])
+            .unwrap();
+        vs.check_eof().unwrap();
     }
-    config
-        .prove_pair(&mut ps, committed, &[&form], &[F::ZERO])
-        .unwrap();
-    let proof = ps.proof();
-    let mut vs = VerifierState::new_std(&ds, &proof);
-    let commitments = [
-        config.receive_commitment(&mut vs).unwrap(),
-        config.receive_commitment(&mut vs).unwrap(),
-    ];
-    for (forms, values) in malformed {
-        assert!(config
-            .verify_pair(&mut vs, commitments.clone(), forms, values)
-            .is_err());
-    }
-    config
-        .verify_pair(&mut vs, commitments, &[&form], &[F::ZERO])
-        .unwrap()
-        .verify(&[&form])
-        .unwrap();
-    vs.check_eof().unwrap();
 }
 
 #[test]
 fn incompatible_source_handles_fail_before_transcript_mutation() {
     type M = Identity<Field256>;
     type F = Field256;
-    let source = source::<M>(Mode::Standard);
-    let config = &source;
-    let mut different_rate = source.tuning().clone();
-    different_rate.starting_log_inv_rate += 1;
-    let mut different_folding = source.tuning().clone();
-    different_folding.folding_factor = FoldingFactor::Constant(3);
-    let alternatives = [
-        ProtocolConfig::<M>::derive(source.security().clone(), different_rate).unwrap(),
-        ProtocolConfig::<M>::derive(source.security().clone(), different_folding).unwrap(),
-        ProtocolConfig::<M>::derive(
-            source.security().clone().with_mode(Mode::ZeroKnowledge),
-            source.tuning().clone(),
-        )
-        .unwrap(),
-    ];
-    for other in alternatives {
-        for sources in [[&source, &other], [&other, &source]] {
-            let ds = DomainSeparator::protocol(&"incompatible-source-handles").instance(&Empty);
-            let mut ps = ProverState::new_std(&ds);
-            let handles =
-                sources.map(|source| source.commit(&mut ps, Buffer::from(vec![F::ONE; 256])));
-            let form = Covector::new(vec![F::ONE; 512]);
-            assert!(config
-                .prove_pair(&mut ps, handles, &[&form], &[F::from(512)])
-                .is_err());
-            ps.prover_message(&F::from(987));
-            let proof = ps.proof();
-            let mut vs = VerifierState::new_std(&ds, &proof);
-            for source in sources {
-                let _ = source.receive_commitment(&mut vs).unwrap();
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let source = source::<M>(mode);
+        let config = &source;
+        let mut different_rate = source.tuning().clone();
+        different_rate.starting_log_inv_rate += 1;
+        let mut different_folding = source.tuning().clone();
+        different_folding.folding_factor = FoldingFactor::Constant(3);
+        let alternatives = [
+            ProtocolConfig::<M>::derive(source.security().clone(), different_rate).unwrap(),
+            ProtocolConfig::<M>::derive(source.security().clone(), different_folding).unwrap(),
+            ProtocolConfig::<M>::derive(
+                source.security().clone().with_mode(match mode {
+                    Mode::Standard => Mode::ZeroKnowledge,
+                    Mode::ZeroKnowledge => Mode::Standard,
+                }),
+                source.tuning().clone(),
+            )
+            .unwrap(),
+        ];
+        for other in alternatives {
+            for sources in [[&source, &other], [&other, &source]] {
+                let ds = DomainSeparator::protocol(&"incompatible-source-handles").instance(&Empty);
+                let mut ps = ProverState::new_std(&ds);
+                let handles =
+                    sources.map(|source| source.commit(&mut ps, Buffer::from(vec![F::ONE; 256])));
+                let form = Covector::new(vec![F::ONE; 512]);
+                assert!(config
+                    .prove_pair(&mut ps, handles, &[&form], &[F::from(512)])
+                    .is_err());
+                ps.prover_message(&F::from(987));
+                let proof = ps.proof();
+                let mut vs = VerifierState::new_std(&ds, &proof);
+                for source in sources {
+                    let _ = source.receive_commitment(&mut vs).unwrap();
+                }
+                let sentinel: F = vs.prover_message().unwrap();
+                assert_eq!(sentinel, F::from(987));
+                vs.check_eof().unwrap();
             }
-            let sentinel: F = vs.prover_message().unwrap();
-            assert_eq!(sentinel, F::from(987));
-            vs.check_eof().unwrap();
         }
     }
 }

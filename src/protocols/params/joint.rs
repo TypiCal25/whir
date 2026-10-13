@@ -2,10 +2,11 @@
 
 use super::{
     branch::SolveMode,
+    build_round::build_mask_oracle,
     code_switch,
     error::Pow,
     protocol_config::{ProtocolConfig, RoundConfig, RoundMode},
-    spec::{FoldingFactor, Mode, RateSchedule, RoundContext},
+    spec::{FoldingFactor, LogInvRate, OodSampleBudget, RateSchedule, RoundContext},
     sumcheck,
 };
 use crate::{
@@ -17,8 +18,7 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
     pub(crate) fn pair_config(&self) -> VerificationResult<Self> {
         let tuning = self.tuning();
         // Check untrusted dimensions before the parameter solver performs arithmetic.
-        if self.security().mode != Mode::Standard
-            || tuning.vector_size.checked_mul(2).is_none()
+        if tuning.vector_size.checked_mul(2).is_none()
             || tuning.starting_log_inv_rate >= usize::BITS
             || matches!(
                 tuning.rate_schedule,
@@ -45,11 +45,40 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
             folding_factor: source.interleaving_depth().ilog2(),
             log_inv_rate: tuning.starting_log_inv_rate,
         };
+        let t_ood = first.code_switch().out_domain_samples();
+        let (round_mode, solve_mode) = if let Some(zk_spec) = self.security().as_zk() {
+            // Keep the original mask code rate and add one selector mask.
+            let code = first
+                .mask_oracle()
+                .ok_or(VerificationError)?
+                .sumcheck_masks()
+                .c_zk_commit();
+            let log_inv_rate = (code.codeword_length() / code.vector_size()).ilog2();
+            let oracle = build_mask_oracle(
+                zk_spec,
+                &context,
+                &source,
+                t_ood,
+                LogInvRate::new(log_inv_rate),
+                first.round_index(),
+            )
+            .map_err(|_| VerificationError)?;
+            let solve_mode = SolveMode::ZeroKnowledge(oracle.info());
+            (
+                RoundMode::ZeroKnowledge {
+                    t_ood: OodSampleBudget::new(t_ood),
+                    mask_oracle: Box::new(oracle),
+                },
+                solve_mode,
+            )
+        } else {
+            (RoundMode::Standard, SolveMode::Standard)
+        };
         let sumcheck = sumcheck::solve(
             self.security(),
             &context,
             &source,
-            SolveMode::Standard,
+            solve_mode,
             Pow::RoundSumcheck {
                 index: first.round_index(),
             },
@@ -59,8 +88,8 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
             self.security(),
             source,
             first.code_switch().target().clone(),
-            first.code_switch().out_domain_samples(),
-            SolveMode::Standard,
+            t_ood,
+            solve_mode,
             first.round_index(),
         )
         .map_err(|_| VerificationError)?;
@@ -77,7 +106,7 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
                 first.round_index(),
                 sumcheck,
                 code_switch,
-                RoundMode::Standard,
+                round_mode,
             )),
             self.tail_rounds().to_vec(),
             self.basecase_plan().clone(),
@@ -96,7 +125,7 @@ mod tests {
             fields::{Field256, Field64_3},
         },
         bits::Bits,
-        protocols::params::{SecuritySpec, TuningSpec},
+        protocols::params::{Mode, SecuritySpec, TuningSpec},
     };
 
     fn source<M: Embedding + Default>(mode: Mode, vector_size: usize) -> ProtocolConfig<M> {
@@ -112,8 +141,8 @@ mod tests {
         .unwrap()
     }
 
-    fn check_pair<M: Embedding + Default>() {
-        let source = source::<M>(Mode::Standard, 256);
+    fn check_pair<M: Embedding + Default>(mode: Mode) {
+        let source = source::<M>(mode, 256);
         let config = source.pair_config().unwrap();
         let original = source.first_round().unwrap();
         let first = config.first_round().unwrap();
@@ -152,24 +181,38 @@ mod tests {
         assert_eq!(config.security().target_security_bits, 128);
         config.validate_security_target_met().unwrap();
         config.validate_pow_budget().unwrap();
+
+        if let Some(oracle) = first.mask_oracle() {
+            // Three sumcheck rounds need three masks and three fresh masks.
+            assert_eq!(oracle.sumcheck_masks().num_masks(), 3);
+            assert_eq!(oracle.sumcheck_masks().c_zk_commit().num_vectors(), 6);
+            assert_eq!(oracle.cs_mask(), original.mask_oracle().unwrap().cs_mask());
+        }
     }
 
     #[test]
     fn bn254_standard_keeps_commitments_and_adds_one_selector() {
-        check_pair::<Identity<Field256>>();
+        check_pair::<Identity<Field256>>(Mode::Standard);
+    }
+
+    #[test]
+    fn bn254_zero_knowledge_adds_one_selector_mask() {
+        check_pair::<Identity<Field256>>(Mode::ZeroKnowledge);
     }
 
     #[test]
     fn extension_standard_keeps_base_field_commitment_encoding() {
-        check_pair::<Basefield<Field64_3>>();
+        check_pair::<Basefield<Field64_3>>(Mode::Standard);
     }
 
     #[test]
-    fn zero_knowledge_and_basecase_only_sources_are_rejected() {
+    fn extension_zero_knowledge_adds_one_selector_mask() {
+        check_pair::<Basefield<Field64_3>>(Mode::ZeroKnowledge);
+    }
+
+    #[test]
+    fn basecase_only_sources_are_rejected() {
         assert!(source::<Identity<Field256>>(Mode::Standard, 8)
-            .validate_pair()
-            .is_err());
-        assert!(source::<Basefield<Field64_3>>(Mode::ZeroKnowledge, 256)
             .validate_pair()
             .is_err());
     }

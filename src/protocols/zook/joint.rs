@@ -21,7 +21,7 @@ use crate::{
 };
 
 impl<M: Embedding + Default> ProtocolConfig<M> {
-    /// Check pair support before committing. Only Standard mode with rounds is supported.
+    /// Check pair support before committing. The source must have a code-switch round.
     pub fn validate_pair(&self) -> VerificationResult<()> {
         self.pair_config().map(|_| ())
     }

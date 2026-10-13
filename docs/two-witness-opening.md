@@ -31,11 +31,10 @@ Their shared query rows form one virtual source with twice the interleaving.
 The selector fold then enters the existing code-switch and remaining rounds.
 Parameter derivation checks the new first-round security bounds.
 
-The API supports Standard mode with identity and base-to-extension embeddings.
+The API supports Standard and ZeroKnowledge modes with identity and base-to-extension embeddings.
+ZeroKnowledge folds both source masks and adds one mask for the selector sumcheck round.
 Raw witness lengths can differ, but their padded sizes must match.
 Basecase-only source configurations are unsupported.
-Joint ZeroKnowledge is disabled pending a separate inherited privacy repair.
-The existing basecase behavior, including its zero-witness limitation, remains unchanged.
 
 ```sh
 cargo test --locked protocols::params::joint::tests
@@ -43,5 +42,6 @@ cargo test --locked --test minimal_pair_rows --test minimal_pair_sumcheck --test
 ```
 
 Tests include `20 + 146 = 166`, the selector polynomial, and genuine extension coefficients.
+The opening tests run in both modes.
 They reject changed roots, claims, forms, dimensions, and truncated proofs.
 They also check claim binding and transcript continuation.
