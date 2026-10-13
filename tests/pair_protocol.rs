@@ -49,14 +49,14 @@ struct Example<M: Embedding> {
     stage_challenge: M::Target,
 }
 
-fn prove_example<M>(mode: Mode, extension_coefficient: M::Target) -> Example<M>
+fn prove_example<M>(config: ProtocolConfig<M>, extension_coefficient: M::Target) -> Example<M>
 where
     M: Embedding + Default,
     M::Target: Default + Zeroize + Codec,
     Standard: Distribution<M::Source> + Distribution<M::Target>,
 {
     let config: ProtocolConfig<M> =
-        serde_json::from_value(serde_json::to_value(source::<M>(mode)).unwrap()).unwrap();
+        serde_json::from_value(serde_json::to_value(config).unwrap()).unwrap();
     let n = config.tuning().vector_size;
     let mut left = vec![M::Source::ZERO; n];
     let mut right = left.clone();
@@ -149,8 +149,8 @@ where
         .map_err(|_| ())?;
     assert_eq!(
         result.evaluation_point.len(),
-        9,
-        "selector plus eight original variables"
+        example.config.tuning().vector_size.ilog2() as usize + 1,
+        "selector plus the original variables"
     );
     assert_eq!(result.evaluation_point, example.result.evaluation_point);
     assert_eq!(result.rlc_coefficients, example.result.rlc_coefficients);
@@ -167,7 +167,7 @@ where
 #[test]
 fn hand_calculated_claims_use_both_existing_commitments_at_128_bits() {
     for mode in [Mode::Standard, Mode::ZeroKnowledge] {
-        let example = prove_example::<Identity<Field256>>(mode, Field256::from(19));
+        let example = prove_example(source::<Identity<Field256>>(mode), Field256::from(19));
         verify_example(&example, Change::None).unwrap();
     }
 }
@@ -177,16 +177,43 @@ fn genuine_extension_coefficients_open_base_field_witnesses_at_128_bits() {
     let e = Field64_3::new(2u64.into(), 3u64.into(), 5u64.into());
     assert_ne!(e, Field64_3::from(2));
     for mode in [Mode::Standard, Mode::ZeroKnowledge] {
-        let example = prove_example::<Basefield<Field64_3>>(mode, e);
+        let example = prove_example(source::<Basefield<Field64_3>>(mode), e);
         assert_ne!(example.values[1], Field64_3::from(16));
         verify_example(&example, Change::None).unwrap();
     }
 }
 
 #[test]
+fn selector_fold_preserves_a_short_tail_or_an_immediate_basecase() {
+    type F = Field256;
+    for mode in [Mode::Standard, Mode::ZeroKnowledge] {
+        let source = source::<Identity<F>>(mode);
+        for (vector_size, initial, rounds) in [
+            // Source folds 256 -> 32 -> 8, with factors 3 and 2.
+            (256, 3, 2),
+            // Source folds 16 -> 4, then enters the basecase directly.
+            (16, 2, 1),
+        ] {
+            let config = ProtocolConfig::<Identity<F>>::derive(
+                source.security().clone(),
+                TuningSpec {
+                    vector_size,
+                    folding_factor: FoldingFactor::ConstantFromSecondRound { initial, rest: 2 },
+                    ..source.tuning().clone()
+                },
+            )
+            .unwrap();
+            assert_eq!(config.num_rounds(), rounds);
+            let example = prove_example(config, F::from(19));
+            verify_example(&example, Change::None).unwrap();
+        }
+    }
+}
+
+#[test]
 fn changed_roots_claim_values_and_final_forms_are_rejected() {
     for mode in [Mode::Standard, Mode::ZeroKnowledge] {
-        let example = prove_example::<Identity<Field256>>(mode, Field256::from(19));
+        let example = prove_example(source::<Identity<Field256>>(mode), Field256::from(19));
         for change in [
             Change::SwapRoots,
             Change::LeftRoot,
@@ -208,7 +235,7 @@ fn changed_roots_claim_values_and_final_forms_are_rejected() {
 #[test]
 fn truncated_joint_proofs_are_rejected() {
     for mode in [Mode::Standard, Mode::ZeroKnowledge] {
-        let mut example = prove_example::<Identity<Field256>>(mode, Field256::from(19));
+        let mut example = prove_example(source::<Identity<Field256>>(mode), Field256::from(19));
         example
             .proof
             .narg_string
@@ -221,7 +248,7 @@ fn truncated_joint_proofs_are_rejected() {
 fn all_claim_values_precede_the_shared_batching_challenge() {
     type F = Field256;
     for mode in [Mode::Standard, Mode::ZeroKnowledge] {
-        let example = prove_example::<Identity<F>>(mode, F::from(19));
+        let example = prove_example(source::<Identity<F>>(mode), F::from(19));
         let ds = DomainSeparator::protocol(&"two-witness-examples").instance(&Empty);
         let mut observer = VerifierState::new_std(&ds, &example.proof);
         let _ = example.config.receive_commitment(&mut observer).unwrap();
