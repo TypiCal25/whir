@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{
-    algebra::{embedding::Embedding, lift, univariate_evaluate},
+    algebra::{embedding::Embedding, univariate_evaluate},
     buffer::{Buffer, BufferMath, BufferOps},
     protocols::proof_of_work,
     transcript::{
@@ -254,8 +254,8 @@ impl<F: Field> Config<F> {
         let a_folded = match (oracle.a, oracle.a_source) {
             (Some(folded), _) => folded,
             // No rounds: nothing folds, but the caller still expects a
-            // target-field buffer. Cold path; a plain lift is fine.
-            (None, Some(a)) => Buffer::from(lift(embedding, a.to_slice())),
+            // target-field buffer. Keep the lift on the selected backend.
+            (None, Some(a)) => a.mixed_lift(embedding),
             (None, None) => unreachable!("oracle consumed the source buffer without folding"),
         };
         (a_folded, opening)

@@ -7,17 +7,13 @@
 //! `code_switch::prove` / `verify_for_implicit` and `bind_code_switch_mask`
 //! were themselves wrappers around the multi-source primitives.
 
-use ark_ff::{AdditiveGroup, Field};
+use ark_ff::Field;
 use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, RngCore};
 use zeroize::Zeroize;
 
 use crate::{
-    algebra::{
-        dot,
-        embedding::{Embedding, Identity},
-        mixed_dot,
-    },
-    buffer::{Buffer, BufferOps},
+    algebra::embedding::{Embedding, Identity},
+    buffer::{BufferMath, BufferOps},
     hash::Hash,
     protocols::{
         code_switch::{self, CovectorUpdateParams},
@@ -39,12 +35,13 @@ use crate::{
 /// Prove one WHIR round. Round 0 carries the base→ext embedding `M` (its
 /// `witnesses` are `IrsWitness<M::Source>`); the code-switch yields an
 /// `M::Target` witness, so the output block is `ProverBlock<Identity<M::Target>>`.
+/// Returns the next block and this round's sumcheck challenges.
 #[cfg_attr(feature = "tracing", tracing::instrument(skip_all, name = "zook::prove_whir_round", fields(msg_len = round.code_switch().source().message_length(), t = block.witnesses.len())))]
 pub fn prove_whir_round<M, H, R>(
     round: &RoundConfig<M>,
     block: ProverBlock<M>,
     ps: &mut ProverState<H, R>,
-) -> ProverBlock<Identity<M::Target>>
+) -> (ProverBlock<Identity<M::Target>>, Vec<M::Target>)
 where
     M: Embedding,
     M::Target: Field + Default + Zeroize + Codec<[H::U]>,
@@ -58,7 +55,7 @@ where
 {
     let ProverBlock {
         message,
-        covector,
+        mut covector,
         mut sum,
         witnesses,
         theta,
@@ -68,7 +65,7 @@ where
     debug_assert_eq!(witnesses.len(), theta.len());
     debug_assert!(!witnesses.is_empty());
     debug_assert_eq!(
-        mixed_dot(embedding, &covector, &message),
+        message.mixed_dot(embedding, &covector),
         sum,
         "prove_whir_round entry: dot(message, covector) must equal sum"
     );
@@ -78,23 +75,15 @@ where
     let mut masker = RoundMaskOracle::begin(round, ps);
 
     // Sumcheck lifts the source-field message into `M::Target` at its first
-    // fold and returns the folded buffer (the covector folds in place). Move
-    // the host-side `Vec` round state into buffers, fold, and move the folded
-    // result back into `Vec` (downstream steps resize/truncate/index directly,
-    // and code-switch takes `Vec` message). The hops are zero-copy on the CPU
-    // backend.
-    let message_buf = Buffer::from(message);
-    let mut covector_buf = Buffer::from(covector);
-    let (message_buf, opening) = round.sumcheck().prove(
+    // fold. Both buffers stay on the selected backend through code-switch.
+    let (message, opening) = round.sumcheck().prove(
         ps,
         embedding,
-        message_buf,
-        &mut covector_buf,
+        message,
+        &mut covector,
         &mut sum,
         masker.sumcheck_blinding(),
     );
-    let message = message_buf.into_vec();
-    let mut covector = covector_buf.into_vec();
 
     // Round 0's witnesses are base-field; the θ-combine inside the masker lifts
     // them into `M::Target` via the embedding before folding.
@@ -109,18 +98,18 @@ where
     );
 
     debug_assert_eq!(
-        dot(&message, &covector),
+        message.dot(&covector),
         sum,
         "prove_whir_round post-reconcile: dot(message, covector) must equal sum"
     );
 
-    covector.resize(msg_len + masker.covector_extension(), M::Target::ZERO);
+    covector.resize_zeroed(msg_len + masker.covector_extension());
 
     let slot_weights = slot_weights::build(&theta, &opening.round_challenges);
     let cs_witness = round.code_switch().prove_virtual(
         ps,
         message,
-        &witness_refs,
+        witnesses,
         &slot_weights,
         code_switch::Claim {
             covector: &mut covector,
@@ -129,22 +118,21 @@ where
         masker.code_switch_blinding(),
     );
 
-    masker.finish(
-        &opening.round_challenges,
-        &covector[msg_len..],
-        &mut sum,
-        ps,
-    );
+    let cs_mask_covector = covector.read_range(msg_len..covector.len());
+    masker.finish(&opening.round_challenges, &cs_mask_covector, &mut sum, ps);
 
-    covector.truncate(cs_witness.message.len());
+    covector.resize_zeroed(cs_witness.message.len());
 
     debug_assert_eq!(
-        dot(&cs_witness.message, &covector),
+        cs_witness.message.dot(&covector),
         sum,
         "prove_whir_round exit: dot(message, covector) must equal sum"
     );
 
-    ProverBlock::single_source(cs_witness.message, covector, sum, cs_witness.target_witness)
+    (
+        ProverBlock::single_source(cs_witness.message, covector, sum, cs_witness.target_witness),
+        opening.round_challenges,
+    )
 }
 
 /// Verifier-side output of one round: the data needed by the caller to

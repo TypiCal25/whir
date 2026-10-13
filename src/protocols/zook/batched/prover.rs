@@ -15,8 +15,8 @@ use tracing::instrument;
 use zeroize::Zeroize;
 
 use crate::{
-    algebra::{dot, embedding::Identity},
-    buffer::Buffer,
+    algebra::embedding::Identity,
+    buffer::{Buffer, BufferMath, BufferOps},
     hash::Hash,
     protocols::{
         irs_commit::Witness as IrsWitness,
@@ -85,7 +85,7 @@ impl<F: Field + Default + Zeroize> BatchedProtocolConfig<Identity<F>> {
             }
             let mut block = slot.take().expect("bundle present before pre-merge loop");
             for round in &bcfg.pre_merge_rounds {
-                block = prove_whir_round(round, block, ps);
+                block = prove_whir_round(round, block, ps).0;
             }
             *slot = Some(block);
         }
@@ -121,7 +121,7 @@ impl<F: Field + Default + Zeroize> BatchedProtocolConfig<Identity<F>> {
             }
 
             let merged = merge_active(self.schedule(), r, active, ps);
-            carrier = Some(prove_whir_round(round, merged, ps));
+            carrier = Some(prove_whir_round(round, merged, ps).0);
         }
 
         assert!(
@@ -142,13 +142,10 @@ impl<F: Field + Default + Zeroize> BatchedProtocolConfig<Identity<F>> {
             mut witnesses,
             ..
         } = final_block;
-        let _ = self.inner().basecase().prove(
-            ps,
-            Buffer::from(message),
-            &witnesses.remove(0),
-            Buffer::from(covector),
-            sum,
-        );
+        let _ = self
+            .inner()
+            .basecase()
+            .prove(ps, message, &witnesses.remove(0), covector, sum);
     }
 }
 
@@ -184,15 +181,15 @@ where
             1,
             "merge input must be single-source blocks"
         );
-        messages.push(block.message);
-        covectors.push(block.covector);
+        messages.push(block.message.into_vec());
+        covectors.push(block.covector.into_vec());
         sums.push(block.sum);
         witnesses.push(block.witnesses.remove(0));
     }
     let merged = join.selector.prove(ps, &messages, &covectors, &sums);
     ProverBlock {
-        message: merged.merged_message,
-        covector: merged.merged_covector,
+        message: Buffer::from(merged.merged_message),
+        covector: Buffer::from(merged.merged_covector),
         sum: merged.sum,
         witnesses,
         theta: merged.theta,
@@ -238,13 +235,9 @@ fn intro_bundle<F: Field>(
              supported by the batched protocol",
         ),
     };
-    debug_assert_eq!(message.len(), reduced_claim.covector.len());
-    debug_assert_eq!(dot(&message, &reduced_claim.covector), reduced_claim.sum);
+    let covector = Buffer::from(reduced_claim.covector);
+    debug_assert_eq!(message.len(), covector.len());
+    debug_assert_eq!(message.dot(&covector), reduced_claim.sum);
 
-    ProverBlock::single_source(
-        message,
-        reduced_claim.covector,
-        reduced_claim.sum,
-        irs_witness,
-    )
+    ProverBlock::single_source(message, covector, reduced_claim.sum, irs_witness)
 }

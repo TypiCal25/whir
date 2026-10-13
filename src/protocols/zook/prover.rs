@@ -67,6 +67,7 @@ use crate::{
             block::ProverBlock,
             commit::{CommittedState, CommittedWitness},
             round::prove_whir_round,
+            ProverClaim,
         },
     },
     transcript::{
@@ -82,6 +83,7 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
     /// Round 0's code-switch folds the base witness (`IrsWitness<M::Source>`)
     /// into an ext IRS, so only it is embedding-aware; later rounds are ext→ext.
     /// Message, covector, and sum are in `M::Target` throughout.
+    /// Returns the transcript-derived evaluation point and RLC coefficients.
     #[cfg_attr(feature = "tracing", instrument(skip_all, name = "zook::prove", fields(vector_size = self.tuning().vector_size, num_rounds = self.num_rounds(), num_claims = linear_forms.len())))]
     pub fn prove<H, R>(
         &self,
@@ -89,7 +91,8 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         committed: CommittedWitness<M>,
         linear_forms: &[&dyn LinearForm<M::Target>],
         evaluations: &[M::Target],
-    ) where
+    ) -> ProverClaim<M::Target>
+    where
         M::Target: Field + Default + Zeroize + Codec<[H::U]>,
         Standard: Distribution<M::Target>,
         H: DuplexSpongeInterface,
@@ -124,12 +127,22 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
             .zip(&claim_weights)
             .map(|(v, weight)| *v * weight)
             .sum();
+        let covector = Buffer::from(covector);
 
-        let (message, basecase_witness, covector, sum) = match committed.state {
+        // Reduce to basecase inputs while retaining the round challenges.
+        let (message, basecase_witness, covector, sum, mut evaluation_point) = match committed.state
+        {
+            // Basecase-only plan: use the committed witness directly.
             CommittedState::Basecase {
                 message,
                 irs_witness,
-            } => (message, irs_witness, covector, batched_evaluation),
+            } => (
+                message,
+                irs_witness,
+                covector,
+                batched_evaluation,
+                Vec::new(),
+            ),
             CommittedState::Round {
                 message,
                 irs_witness,
@@ -144,9 +157,13 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
                 let first = self
                     .first_round()
                     .expect("CommittedState::Round implies at least one round");
-                let mut block = prove_whir_round::<M, _, _>(first, block, ps);
+                let (mut block, mut evaluation_point) =
+                    prove_whir_round::<M, _, _>(first, block, ps);
                 for round in self.tail_rounds() {
-                    block = prove_whir_round::<Identity<M::Target>, _, _>(round, block, ps);
+                    let (next, challenges) =
+                        prove_whir_round::<Identity<M::Target>, _, _>(round, block, ps);
+                    block = next;
+                    evaluation_point.extend(challenges);
                 }
                 let ProverBlock {
                     message,
@@ -155,20 +172,34 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
                     mut witnesses,
                     ..
                 } = block;
-                (message, witnesses.remove(0), covector, sum)
+                (
+                    message,
+                    witnesses.remove(0),
+                    covector,
+                    sum,
+                    evaluation_point,
+                )
             }
         };
 
         // Standard mode (BasecaseMode::Standard) sends the full witness vector
         // and IRS randomness cleartext. Only call with Mode::ZeroKnowledge if
         // end-to-end hiding is required.
-        let _ = self.basecase().prove(
-            ps,
-            Buffer::from(message),
-            &basecase_witness,
-            Buffer::from(covector),
-            sum,
+        let basecase_opening = self
+            .basecase()
+            .prove(ps, message, &basecase_witness, covector, sum);
+
+        evaluation_point.extend(basecase_opening.evaluation_points);
+        debug_assert_eq!(
+            evaluation_point.len(),
+            self.tuning().vector_size.trailing_zeros() as usize,
+            "evaluation_point length must equal log2(vector_size)"
         );
+
+        ProverClaim {
+            evaluation_point,
+            rlc_coefficients: claim_weights,
+        }
     }
 }
 

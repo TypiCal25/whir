@@ -10,6 +10,7 @@ use ark_ff::Field;
 
 use crate::{
     algebra::embedding::Embedding,
+    buffer::Buffer,
     protocols::irs_commit::{Commitment as IrsCommitment, Witness as IrsWitness},
 };
 
@@ -27,8 +28,8 @@ use crate::{
 /// pre-merge rounds it has length 1 with `theta = [ONE]`. After a selector
 /// merge it has length `t` with `theta` from the merge opening.
 pub struct ProverBlock<M: Embedding> {
-    pub(crate) message: Vec<M::Source>,
-    pub(crate) covector: Vec<M::Target>,
+    pub(crate) message: Buffer<M::Source>,
+    pub(crate) covector: Buffer<M::Target>,
     pub(crate) sum: M::Target,
     pub(crate) witnesses: Vec<IrsWitness<M::Source>>,
     pub(crate) theta: Vec<M::Target>,
@@ -36,8 +37,8 @@ pub struct ProverBlock<M: Embedding> {
 
 impl<M: Embedding> ProverBlock<M> {
     pub(crate) fn single_source(
-        message: Vec<M::Source>,
-        covector: Vec<M::Target>,
+        message: Buffer<M::Source>,
+        covector: Buffer<M::Target>,
         sum: M::Target,
         witness: IrsWitness<M::Source>,
     ) -> Self {

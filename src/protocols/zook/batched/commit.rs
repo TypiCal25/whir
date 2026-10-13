@@ -11,7 +11,7 @@ use tracing::instrument;
 
 use crate::{
     algebra::embedding::Embedding,
-    buffer::{Buffer, BufferOps},
+    buffer::Buffer,
     hash::Hash,
     protocols::{
         irs_commit::Commitment as IrsCommitment,
@@ -83,7 +83,7 @@ impl<M: Embedding + Default> BatchedProtocolConfig<M> {
 
         BundleCommittedWitness {
             state: CommittedState::Round {
-                message: flat.into_vec(),
+                message: flat,
                 irs_witness,
             },
             batching_challenge,
