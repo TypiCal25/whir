@@ -1,10 +1,12 @@
 //! Zook ZK protocol — Construction 9.7.
 
 pub mod commit;
+pub mod joint;
 pub mod prover;
 pub mod verifier;
 
 pub use commit::{Commitment, CommittedWitness};
+pub use joint::JointOpeningError;
 
 pub use crate::protocols::params::protocol_config::ProtocolConfig;
 use crate::{algebra::linear_form::LinearForm, transcript::VerificationResult, verify};

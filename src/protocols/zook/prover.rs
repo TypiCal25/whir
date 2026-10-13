@@ -40,6 +40,8 @@
 //! After all rounds: commit the final folded message via `basecase.commit`
 //! and run `basecase.prove`. Basecase-only plans skip the loop.
 
+use std::borrow::Cow;
+
 use ark_ff::{AdditiveGroup, Field};
 use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, RngCore};
 #[cfg(feature = "tracing")]
@@ -58,7 +60,7 @@ use crate::{
     hash::Hash,
     protocols::{
         code_switch::{self, mixed_fold_chunks},
-        irs_commit::Witness as IrsWitness,
+        irs_commit::{Config as IrsConfig, Witness as IrsWitness},
         mask_proximity,
         mask_proximity::Config as MaskProximityConfig,
         params::protocol_config::{MaskOracleConfig, ProtocolConfig, RoundConfig},
@@ -87,6 +89,28 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         &self,
         ps: &mut ProverState<H, R>,
         committed: CommittedWitness<M>,
+        linear_forms: &[&dyn LinearForm<M::Target>],
+        evaluations: &[M::Target],
+    ) -> ProverClaim<M::Target>
+    where
+        M::Target: Field + Default + Zeroize + Codec<[H::U]>,
+        Standard: Distribution<M::Target>,
+        H: DuplexSpongeInterface,
+        R: RngCore + CryptoRng,
+        u8: Decoding<[H::U]>,
+        [u8; 32]: Decoding<[H::U]>,
+        U64: Codec<[H::U]>,
+        Hash: ProverMessage<[H::U]>,
+    {
+        self.prove_with_second(ps, committed, None, linear_forms, evaluations)
+    }
+
+    /// Share the existing execution after an optional selector fold.
+    pub(crate) fn prove_with_second<H, R>(
+        &self,
+        ps: &mut ProverState<H, R>,
+        committed: CommittedWitness<M>,
+        second: Option<(&IrsConfig<M>, CommittedWitness<M>)>,
         linear_forms: &[&dyn LinearForm<M::Target>],
         evaluations: &[M::Target],
     ) -> ProverClaim<M::Target>
@@ -145,6 +169,18 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
                 message,
                 irs_witness,
             } => {
+                let (message, second) = match second {
+                    None => (message, None),
+                    Some((source, committed)) => match committed.state {
+                        CommittedState::Round {
+                            message: right,
+                            irs_witness,
+                        } => (message.concat(&right), Some((source, irs_witness))),
+                        CommittedState::Basecase { .. } => {
+                            panic!("joint opening requires two round commitments")
+                        }
+                    },
+                };
                 let entry = ProverRoundState::<M> {
                     message,
                     irs_witness,
@@ -155,9 +191,9 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
                 let first = self
                     .first_round()
                     .expect("CommittedState::Round implies at least one round");
-                let mut state = prove_round::<M, _, _>(first, entry, ps);
+                let mut state = prove_round::<M, _, _>(first, entry, second, ps);
                 for round in self.tail_rounds() {
-                    state = prove_round::<Identity<M::Target>, _, _>(round, state, ps);
+                    state = prove_round::<Identity<M::Target>, _, _>(round, state, None, ps);
                 }
                 // After per-round reconciliation, state.sum is bound to
                 // dot(state.message, state.covector) — no extra transcript
@@ -211,6 +247,7 @@ struct ProverRoundState<M: Embedding> {
 fn prove_round<M, H, R>(
     round: &RoundConfig<M>,
     state: ProverRoundState<M>,
+    second: Option<(&IrsConfig<M>, IrsWitness<M::Source>)>,
     ps: &mut ProverState<H, R>,
 ) -> ProverRoundState<Identity<M::Target>>
 where
@@ -261,9 +298,13 @@ where
 
     // Build cs_mask = (folded_irs_masks ‖ cs_fresh_padding), commit its tree,
     // send mask_eval_sum cleartext, reconcile sum to the unmasked dot.
+    let (physical_source, witnesses) = match second {
+        Some((source, right)) => (source, vec![irs_witness, right]),
+        None => (round.code_switch().source(), vec![irs_witness]),
+    };
     masker.bind_code_switch_mask(
         round.code_switch().source().embedding(),
-        &irs_witness,
+        &witnesses,
         &opening,
         &mut sum,
         ps,
@@ -277,10 +318,11 @@ where
 
     // Extend covector for ZK mask region; +0 in Standard mode.
     covector.resize_zeroed(msg_len + masker.covector_extension());
-    let cs_witness = round.code_switch().prove(
+    let cs_witness = round.code_switch().prove_with_sources(
         ps,
         message,
-        irs_witness,
+        physical_source,
+        witnesses,
         code_switch::Claim {
             covector: &mut covector,
             sum: &mut sum,
@@ -545,7 +587,7 @@ impl<'a, F: Field + Default + Zeroize> RoundMaskOracle<'a, F> {
     fn bind_code_switch_mask<M, H, R>(
         &mut self,
         embedding: &M,
-        irs_witness: &IrsWitness<M::Source>,
+        irs_witnesses: &[IrsWitness<M::Source>],
         opening: &SumcheckOpening<F>,
         sum: &mut F,
         ps: &mut ProverState<H, R>,
@@ -576,12 +618,20 @@ impl<'a, F: Field + Default + Zeroize> RoundMaskOracle<'a, F> {
         // cs_mask = (r_folded ‖ s): r folds the source IRS randomness by the
         // sumcheck challenges (embedding-aware — see `mixed_fold_chunks`).
         let source_mask_len = mask_oracle.l_zk().get() - cs_fresh_padding.len();
+        let mut source_masks = match irs_witnesses {
+            [single] => Cow::Borrowed(single.masks.to_slice()),
+            [left, right] => Cow::Owned(left.masks.concat(&right.masks).into_vec()),
+            _ => unreachable!("only one source or one source pair is supported"),
+        };
         let r_folded = mixed_fold_chunks(
             embedding,
-            irs_witness.masks.to_slice(),
+            &source_masks,
             source_mask_len,
             &opening.round_challenges,
         );
+        if let Cow::Owned(masks) = &mut source_masks {
+            masks.zeroize();
+        }
 
         // Build and commit the cs-mask tree (transcript: commitment hash).
         let cs_mask = CodeSwitchMask::build_and_commit(
