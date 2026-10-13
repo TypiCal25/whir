@@ -286,8 +286,7 @@ fn malformed_claim_dimensions_fail_before_transcript_mutation() {
     ];
     let form = Covector::new(vec![F::ZERO; 512]);
     let short = Covector::new(vec![F::ZERO; 256]);
-    let malformed: [ClaimInput<'_>; 3] =
-        [(&[], &[]), (&[&form], &[]), (&[&short], &[F::ZERO])];
+    let malformed: [ClaimInput<'_>; 3] = [(&[], &[]), (&[&form], &[]), (&[&short], &[F::ZERO])];
     for (forms, values) in malformed {
         assert_eq!(
             config
@@ -319,4 +318,49 @@ fn malformed_claim_dimensions_fail_before_transcript_mutation() {
         .verify(&[&form])
         .unwrap();
     vs.check_eof().unwrap();
+}
+
+#[test]
+fn incompatible_source_handles_fail_before_transcript_mutation() {
+    type M = Identity<Field256>;
+    type F = Field256;
+    let source = source::<M>(Mode::Standard);
+    let config = JointConfig::derive(&source).unwrap();
+    let mut different_rate = source.tuning().clone();
+    different_rate.starting_log_inv_rate += 1;
+    let mut different_folding = source.tuning().clone();
+    different_folding.folding_factor = FoldingFactor::Constant(3);
+    let alternatives = [
+        ProtocolConfig::<M>::derive(source.security().clone(), different_rate).unwrap(),
+        ProtocolConfig::<M>::derive(source.security().clone(), different_folding).unwrap(),
+        ProtocolConfig::<M>::derive(
+            source.security().clone().with_mode(Mode::ZeroKnowledge),
+            source.tuning().clone(),
+        )
+        .unwrap(),
+    ];
+    for other in alternatives {
+        for sources in [[&source, &other], [&other, &source]] {
+            let ds = DomainSeparator::protocol(&"incompatible-source-handles").instance(&Empty);
+            let mut ps = ProverState::new_std(&ds);
+            let handles =
+                sources.map(|source| source.commit(&mut ps, Buffer::from(vec![F::ONE; 256])));
+            let form = Covector::new(vec![F::ONE; 512]);
+            assert_eq!(
+                config
+                    .prove_pair(&mut ps, handles, &[&form], &[F::from(512)])
+                    .unwrap_err(),
+                JointOpeningError::InvalidWitness
+            );
+            ps.prover_message(&F::from(987));
+            let proof = ps.proof();
+            let mut vs = VerifierState::new_std(&ds, &proof);
+            for source in sources {
+                let _ = source.receive_commitment(&mut vs).unwrap();
+            }
+            let sentinel: F = vs.prover_message().unwrap();
+            assert_eq!(sentinel, F::from(987));
+            vs.check_eof().unwrap();
+        }
+    }
 }

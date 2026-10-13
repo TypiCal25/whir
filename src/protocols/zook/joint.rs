@@ -91,10 +91,20 @@ impl<M: Embedding + Default> JointConfig<M> {
         Hash: ProverMessage<[H::U]>,
     {
         self.check_opening(forms, values)?;
-        let n = self.source().tuning().vector_size;
+        let source = self
+            .source()
+            .first_round()
+            .expect("validated first round")
+            .code_switch()
+            .source();
         if committed.iter().any(|w| {
             !matches!(&w.state,
-            CommittedState::Round { message, .. } if message.len() == n)
+            CommittedState::Round { message, irs_witness }
+                if message.len() == source.vector_size()
+                    && irs_witness.matrix.len() == source.size()
+                    && irs_witness.masks.len() == source.mask_length() * source.num_messages()
+                    && irs_witness.matrix_witness.num_nodes()
+                        == source.matrix_commit().merkle_tree.num_nodes())
         }) {
             return Err(JointOpeningError::InvalidWitness);
         }
@@ -105,12 +115,6 @@ impl<M: Embedding + Default> JointConfig<M> {
             ps.prover_message(value);
         }
         let [left, right] = committed;
-        let source = self
-            .source()
-            .first_round()
-            .expect("validated first round")
-            .code_switch()
-            .source();
         Ok(self
             .joint()
             .prove_with_second(ps, left, Some((source, right)), forms, values))
