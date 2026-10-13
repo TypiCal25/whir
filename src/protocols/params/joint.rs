@@ -7,11 +7,10 @@ use crate::algebra::embedding::Embedding;
 
 use super::{
     branch::SolveMode,
-    build_round::build_mask_oracle,
     code_switch,
     error::{DeriveError, Pow},
     protocol_config::{ProtocolConfig, RoundConfig, RoundMode},
-    spec::{FoldingFactor, LogInvRate, Mode, RateSchedule, RoundContext},
+    spec::{FoldingFactor, Mode, RateSchedule, RoundContext},
     sumcheck,
 };
 
@@ -54,10 +53,6 @@ impl<M: Embedding + Default> JointConfig<M> {
         if source.security().mode == Mode::ZeroKnowledge {
             return Err(JointConfigError::ZeroKnowledgeUnavailable);
         }
-        Self::derive_plan(source)
-    }
-
-    fn derive_plan(source: &ProtocolConfig<M>) -> Result<Self, JointConfigError> {
         // Bound deserialized inputs before the existing solver computes rates and sizes.
         let tuning = source.tuning();
         if tuning.vector_size.checked_mul(2).is_none()
@@ -89,42 +84,11 @@ impl<M: Embedding + Default> JointConfig<M> {
         };
         let security = source.security();
         let t_ood = first.code_switch().out_domain_samples();
-        let (mode, solve_mode) = if let Some(zk_spec) = security.as_zk() {
-            // The original mask code has a power-of-two inverse rate. Preserve it.
-            let original_mask_code = first
-                .mask_oracle()
-                .ok_or(JointConfigError::InvalidSource)?
-                .sumcheck_masks()
-                .c_zk_commit();
-            let inverse_rate =
-                original_mask_code.codeword_length() / original_mask_code.vector_size();
-            if !inverse_rate.is_power_of_two() {
-                return Err(JointConfigError::InvalidSource);
-            }
-            let oracle = build_mask_oracle(
-                zk_spec,
-                &context,
-                &virtual_source,
-                t_ood,
-                LogInvRate::new(inverse_rate.ilog2()),
-                first.round_index(),
-            )?;
-            let solve_mode = SolveMode::ZeroKnowledge(oracle.info());
-            (
-                RoundMode::ZeroKnowledge {
-                    t_ood: super::OodSampleBudget::new(t_ood),
-                    mask_oracle: Box::new(oracle),
-                },
-                solve_mode,
-            )
-        } else {
-            (RoundMode::Standard, SolveMode::Standard)
-        };
         let sumcheck = sumcheck::solve(
             security,
             &context,
             &virtual_source,
-            solve_mode,
+            SolveMode::Standard,
             Pow::RoundSumcheck {
                 index: first.round_index(),
             },
@@ -134,7 +98,7 @@ impl<M: Embedding + Default> JointConfig<M> {
             virtual_source,
             first.code_switch().target().clone(),
             t_ood,
-            solve_mode,
+            SolveMode::Standard,
             first.round_index(),
         )?;
         let mut tuning = source.tuning().clone();
@@ -150,7 +114,7 @@ impl<M: Embedding + Default> JointConfig<M> {
                 first.round_index(),
                 sumcheck,
                 code_switch,
-                mode,
+                RoundMode::Standard,
             )),
             source.tail_rounds().to_vec(),
             source.basecase_plan().clone(),
@@ -205,17 +169,10 @@ mod tests {
         .unwrap()
     }
 
-    fn check_pair<M: Embedding + Default>(mode: Mode) {
-        let source = source::<M>(mode, 256);
-        let config = JointConfig::derive_plan(&source).unwrap();
-        if mode == Mode::Standard {
-            config.validate().unwrap();
-        } else {
-            assert_eq!(
-                config.validate(),
-                Err(JointConfigError::ZeroKnowledgeUnavailable)
-            );
-        }
+    fn check_pair<M: Embedding + Default>() {
+        let source = source::<M>(Mode::Standard, 256);
+        let config = JointConfig::derive(&source).unwrap();
+        config.validate().unwrap();
         let original = source.first_round().unwrap();
         let first = config.joint().first_round().unwrap();
         let original_irs = original.code_switch().source();
@@ -253,33 +210,16 @@ mod tests {
         assert_eq!(config.joint().security().target_security_bits, 128);
         config.joint().validate_security_target_met().unwrap();
         config.joint().validate_pow_budget().unwrap();
-
-        if let Some(oracle) = first.mask_oracle() {
-            // Three sumcheck rounds need three independent masks and three fresh masks.
-            assert_eq!(oracle.sumcheck_masks().num_masks(), 3);
-            assert_eq!(oracle.sumcheck_masks().c_zk_commit().num_vectors(), 6);
-            assert_eq!(oracle.cs_mask(), original.mask_oracle().unwrap().cs_mask());
-        }
     }
 
     #[test]
     fn bn254_standard_keeps_commitments_and_adds_one_selector() {
-        check_pair::<Identity<Field256>>(Mode::Standard);
-    }
-
-    #[test]
-    fn bn254_zero_knowledge_plan_reserves_one_extra_selector_mask() {
-        check_pair::<Identity<Field256>>(Mode::ZeroKnowledge);
+        check_pair::<Identity<Field256>>();
     }
 
     #[test]
     fn extension_standard_keeps_base_field_commitment_encoding() {
-        check_pair::<Basefield<Field64_3>>(Mode::Standard);
-    }
-
-    #[test]
-    fn extension_zero_knowledge_plan_reserves_one_extra_selector_mask() {
-        check_pair::<Basefield<Field64_3>>(Mode::ZeroKnowledge);
+        check_pair::<Basefield<Field64_3>>();
     }
 
     #[test]

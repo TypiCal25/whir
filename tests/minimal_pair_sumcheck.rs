@@ -1,17 +1,16 @@
-//! Feasibility tests for one extra quadratic selector round.
-//! These tests do not implement the joint commitment or mask-authentication protocol.
+//! Readable algebra for the extra quadratic selector round.
 use ark_ff::{AdditiveGroup, Field};
 use whir::{
     algebra::{
         dot,
         embedding::{Basefield, Embedding, Identity},
         fields::{Field64, Field64_3},
-        mixed_dot, univariate_evaluate,
+        mixed_dot,
     },
     buffer::{Buffer, BufferMath, BufferOps},
     protocols::{
         proof_of_work,
-        sumcheck::{Config, SumcheckMaskLen, SumcheckMode},
+        sumcheck::{Config, SumcheckMode},
     },
     transcript::{codecs::Empty, Codec, DomainSeparator, ProverState, VerifierState},
 };
@@ -45,7 +44,7 @@ fn selector_polynomial_is_quadratic_and_starts_from_166() {
     assert_eq!(q(F::from(2)), F::from(468));
 }
 
-fn existing_sumcheck_handles_pair<M>(embedding: M, mode: SumcheckMode, extra_coefficient: M::Target)
+fn existing_sumcheck_handles_pair<M>(embedding: M, extra_coefficient: M::Target)
 where
     M: Embedding<Source = Field64>,
     M::Target: Codec<[u8]>,
@@ -62,16 +61,8 @@ where
     form[0] += extra_coefficient;
     let claim = mixed_dot(&embedding, &form, &witness);
     // The source first round folds one variable. The joint round folds two.
-    let cfg = Config::new(8, proof_of_work::Config::none(), 2, mode.clone());
+    let cfg = Config::new(8, proof_of_work::Config::none(), 2, SumcheckMode::Standard);
     assert_eq!(cfg.final_size(), 2);
-    let masks: Vec<_> = match mode {
-        SumcheckMode::Standard => vec![],
-        // Deterministic test masks only. Production commits fresh random masks.
-        SumcheckMode::ZeroKnowledge { .. } => [11u64, 17, 23, 31, 37, 41]
-            .into_iter()
-            .map(M::Target::from)
-            .collect(),
-    };
     let ds = DomainSeparator::protocol(&cfg).instance(&Empty);
     let mut ps = ProverState::new_std(&ds);
     let mut folded_form = Buffer::from(form.clone());
@@ -82,7 +73,7 @@ where
         Buffer::from(witness.clone()),
         &mut folded_form,
         &mut sum,
-        &masks,
+        &[],
     );
     assert_eq!(opening.round_challenges.len(), 2);
     let selector = opening.round_challenges[0];
@@ -108,15 +99,7 @@ where
                 + selected_form[i + 2] * next_coordinate
         );
     }
-    let mask_sum: M::Target = masks
-        .chunks_exact(3)
-        .zip(&opening.round_challenges)
-        .map(|(mask, &r)| univariate_evaluate(mask, r))
-        .sum();
-    assert_eq!(
-        sum,
-        mask_sum + opening.mask_rlc * folded_witness.dot(&folded_form)
-    );
+    assert_eq!(sum, folded_witness.dot(&folded_form));
     let proof = ps.proof();
     let mut vs = VerifierState::new_std(&ds, &proof);
     let mut verifier_sum = claim;
@@ -129,25 +112,11 @@ where
 
 #[test]
 fn existing_sumcheck_supports_selector_with_identity() {
-    for mode in [
-        SumcheckMode::Standard,
-        SumcheckMode::ZeroKnowledge {
-            mask_length: SumcheckMaskLen::new(3),
-        },
-    ] {
-        existing_sumcheck_handles_pair(Identity::<Field64>::default(), mode, Field64::ZERO);
-    }
+    existing_sumcheck_handles_pair(Identity::<Field64>::default(), Field64::ZERO);
 }
 
 #[test]
 fn existing_sumcheck_supports_selector_with_genuine_extension_coefficients() {
     let extension = Field64_3::new(Field64::ZERO, Field64::ONE, Field64::ZERO);
-    for mode in [
-        SumcheckMode::Standard,
-        SumcheckMode::ZeroKnowledge {
-            mask_length: SumcheckMaskLen::new(3),
-        },
-    ] {
-        existing_sumcheck_handles_pair(Basefield::<Field64_3>::default(), mode, extension);
-    }
+    existing_sumcheck_handles_pair(Basefield::<Field64_3>::default(), extension);
 }

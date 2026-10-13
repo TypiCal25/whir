@@ -1,6 +1,4 @@
-//! Feasibility tests for existing IRS APIs. These are not a joint proof protocol.
-
-use std::num::NonZeroUsize;
+//! Both commitment roots authenticate the rows used by the selector fold.
 
 use ark_ff::{AdditiveGroup, Field};
 use ark_std::rand::{distributions::Standard, prelude::Distribution};
@@ -23,7 +21,7 @@ use whir::{
     },
 };
 
-fn check_pair<M: Embedding<Source = Field64> + Default>(mode: IrsMode, require_extension: bool)
+fn check_pair<M: Embedding<Source = Field64> + Default>(require_extension: bool)
 where
     M::Target: Codec + Field<BasePrimeField = Field64>,
     Standard: Distribution<M::Source> + Distribution<M::Target>,
@@ -40,7 +38,7 @@ where
         vector_size: n,
         interleaving_depth: interleaving,
         rate: 0.25,
-        mode,
+        mode: IrsMode::Standard,
     });
     let ds = DomainSeparator::protocol(&config)
         .session(&"minimal-pair-rows")
@@ -84,13 +82,6 @@ where
         chunk_len,
         &folding_point,
     );
-    let both_masks = left_witness.masks.concat(&right_witness.masks);
-    let folded_mask = mixed_fold_chunks(
-        &embedding,
-        both_masks.to_slice(),
-        config.mask_length(),
-        &folding_point,
-    );
 
     for ((&point, row), &actual) in opened
         .points
@@ -99,12 +90,10 @@ where
         .zip(collapsed.to_slice())
     {
         let point = embedding.map(point);
-        let message_value = univariate_evaluate(&folded_message, point);
-        let mask_value = univariate_evaluate(&folded_mask, point);
-        let expected = message_value + point.pow([chunk_len as u64]) * mask_value;
+        let expected = univariate_evaluate(&folded_message, point);
         assert_eq!(
             actual, expected,
-            "opened rows must encode the folded message and both masks"
+            "opened rows must encode the folded message"
         );
         let direct: M::Target = row
             .iter()
@@ -146,31 +135,11 @@ where
 }
 
 #[test]
-fn identity_standard_pair_rows_equal_folded_encoding() {
-    check_pair::<Identity<Field64>>(IrsMode::Standard, false);
+fn identity_pair_rows_equal_folded_encoding() {
+    check_pair::<Identity<Field64>>(false);
 }
 
 #[test]
-fn identity_zk_pair_rows_include_both_source_masks() {
-    check_pair::<Identity<Field64>>(
-        IrsMode::ZeroKnowledge {
-            mask_length: NonZeroUsize::new(48).unwrap(),
-        },
-        false,
-    );
-}
-
-#[test]
-fn extension_standard_pair_rows_equal_folded_encoding() {
-    check_pair::<Basefield<Field64_3>>(IrsMode::Standard, true);
-}
-
-#[test]
-fn extension_zk_pair_rows_include_both_source_masks() {
-    check_pair::<Basefield<Field64_3>>(
-        IrsMode::ZeroKnowledge {
-            mask_length: NonZeroUsize::new(48).unwrap(),
-        },
-        true,
-    );
+fn extension_pair_rows_equal_folded_encoding() {
+    check_pair::<Basefield<Field64_3>>(true);
 }

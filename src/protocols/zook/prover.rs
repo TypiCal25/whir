@@ -40,8 +40,6 @@
 //! After all rounds: commit the final folded message via `basecase.commit`
 //! and run `basecase.prove`. Basecase-only plans skip the loop.
 
-use std::borrow::Cow;
-
 use ark_ff::{AdditiveGroup, Field};
 use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, RngCore};
 #[cfg(feature = "tracing")]
@@ -298,13 +296,9 @@ where
 
     // Build cs_mask = (folded_irs_masks ‖ cs_fresh_padding), commit its tree,
     // send mask_eval_sum cleartext, reconcile sum to the unmasked dot.
-    let (physical_source, witnesses) = match second {
-        Some((source, right)) => (source, vec![irs_witness, right]),
-        None => (round.code_switch().source(), vec![irs_witness]),
-    };
     masker.bind_code_switch_mask(
         round.code_switch().source().embedding(),
-        &witnesses,
+        &irs_witness,
         &opening,
         &mut sum,
         ps,
@@ -318,6 +312,10 @@ where
 
     // Extend covector for ZK mask region; +0 in Standard mode.
     covector.resize_zeroed(msg_len + masker.covector_extension());
+    let (physical_source, witnesses) = match second {
+        Some((source, right)) => (source, vec![irs_witness, right]),
+        None => (round.code_switch().source(), vec![irs_witness]),
+    };
     let cs_witness = round.code_switch().prove_with_sources(
         ps,
         message,
@@ -587,7 +585,7 @@ impl<'a, F: Field + Default + Zeroize> RoundMaskOracle<'a, F> {
     fn bind_code_switch_mask<M, H, R>(
         &mut self,
         embedding: &M,
-        irs_witnesses: &[IrsWitness<M::Source>],
+        irs_witness: &IrsWitness<M::Source>,
         opening: &SumcheckOpening<F>,
         sum: &mut F,
         ps: &mut ProverState<H, R>,
@@ -618,20 +616,12 @@ impl<'a, F: Field + Default + Zeroize> RoundMaskOracle<'a, F> {
         // cs_mask = (r_folded ‖ s): r folds the source IRS randomness by the
         // sumcheck challenges (embedding-aware — see `mixed_fold_chunks`).
         let source_mask_len = mask_oracle.l_zk().get() - cs_fresh_padding.len();
-        let mut source_masks = match irs_witnesses {
-            [single] => Cow::Borrowed(single.masks.to_slice()),
-            [left, right] => Cow::Owned(left.masks.concat(&right.masks).into_vec()),
-            _ => unreachable!("only one source or one source pair is supported"),
-        };
         let r_folded = mixed_fold_chunks(
             embedding,
-            &source_masks,
+            irs_witness.masks.to_slice(),
             source_mask_len,
             &opening.round_challenges,
         );
-        if let Cow::Owned(masks) = &mut source_masks {
-            masks.zeroize();
-        }
 
         // Build and commit the cs-mask tree (transcript: commitment hash).
         let cs_mask = CodeSwitchMask::build_and_commit(
