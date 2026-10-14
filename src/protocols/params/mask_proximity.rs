@@ -11,7 +11,7 @@ use crate::{
         irs_commit::{num_in_domain_queries, Config as IrsConfig},
         params::{
             basecase::ZookFinalOpeningSoundness,
-            bounds::{error_bits, rate, usize_to_f64},
+            bounds::{error_bits, out_of_domain_bits, rate, usize_to_f64},
             error::{grind_to_at, DeriveError, Pow, ZookSecurityError},
             irs_commit::{solve as solve_irs, validate_single_polynomial},
             protocol_config::JointMaskConfig,
@@ -111,11 +111,12 @@ fn next_range(end: &mut usize, length: usize) -> Result<Range<usize>, DeriveErro
 
 /// Joint-mask DEEP binding plus the initial-mask Frobenius check.
 ///
-/// `epsilon <= L*(L-1)*m/(2*Q) + L*m/Q = L*(L+1)*m/(2*Q)`.
+/// `epsilon <= L*(L-1)*m/(2*(Q-1)) + L*m/(Q-1) = L*(L+1)*m/(2*(Q-1))`.
 /// Here `L = masks.list_size()`, `m = masks.message_length()`, and `Q = |F|`.
 /// The first term bounds DEEP collisions; the second bounds the Frobenius check.
-/// Section 6.3, “The zk-IOPP”, Phase 0 samples `z` uniformly from `F`,
-/// including the evaluation domain; the denominator is therefore `Q`.
+/// Unlike §6.3, “The zk-IOPP”, Phase 0, sampling excludes zero, where the
+/// shifted membership blinder vanishes. Nonzero evaluation-domain points remain
+/// allowed, so the root-count bounds use the challenge-domain size `Q-1`.
 ///
 /// ProveKit Prover Whitepaper §6.4, “Soundness”, theorem “IOPP soundness”,
 /// Phase 0 bound and the following union-bound remark.
@@ -126,7 +127,7 @@ pub fn zook_mask_binding_bits<F: Field>(
     let list = masks.list_size();
     Ok(error_bits(
         list.log2() + (list + 1.0).log2() - 1.0 + usize_to_f64(masks.message_length()).log2()
-            - F::field_size_bits(),
+            - out_of_domain_bits(F::field_size_bits(), 1)?,
     ))
 }
 
@@ -141,12 +142,12 @@ mod tests {
     #[test]
     fn mask_binding_includes_frobenius_error() {
         let masks = johnson_code::<Identity<Field64_2>>(256, 1, 0.25);
-        let field = 2.0_f64.powf(Field64_2::field_size_bits());
+        let challenges = 2.0_f64.powf(Field64_2::field_size_bits()) - 1.0;
         let list = masks.list_size();
         let degree = masks.message_length() as f64;
         assert_probability_bits(
             zook_mask_binding_bits(&masks).unwrap(),
-            list * (list - 1.0) / 2.0 * degree / field + list * degree / field,
+            list * (list - 1.0) / 2.0 * degree / challenges + list * degree / challenges,
         );
     }
 }

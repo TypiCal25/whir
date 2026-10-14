@@ -10,7 +10,7 @@ use crate::{
     },
     protocols::params::JointMaskConfig,
     transcript::{
-        Codec, DuplexSpongeInterface, ProverState, VerificationResult, VerifierMessage,
+        Codec, Decoding, DuplexSpongeInterface, ProverState, VerificationResult, VerifierMessage,
         VerifierState,
     },
 };
@@ -39,8 +39,7 @@ where
     H: DuplexSpongeInterface,
     R: RngCore + CryptoRng,
 {
-    // Section 6.3 samples from all of F, including the code domain and zero.
-    let point = ps.verifier_message();
+    let point = binding_challenge(ps);
     let forms = binding_forms(config, point, source_degree);
     let identity = Identity::new();
     let evaluation = forms[0].evaluate(&identity, coefficients);
@@ -63,13 +62,27 @@ where
     F: Field + Codec<[H::U]>,
     H: DuplexSpongeInterface,
 {
-    let point = vs.verifier_message();
+    let point = binding_challenge(vs);
     let evaluation = vs.prover_message()?;
     let membership = vs.prover_message()?;
     Ok(MaskBinding {
         forms: binding_forms(config, point, source_degree),
         values: [evaluation, membership, frobenius(membership, source_degree)],
     })
+}
+
+/// Exclude zero: the shifted membership blinder vanishes there, exposing a mask coefficient.
+fn binding_challenge<F, T>(transcript: &mut T) -> F
+where
+    F: Field + Decoding<[T::U]>,
+    T: VerifierMessage,
+{
+    loop {
+        let point: F = transcript.verifier_message();
+        if !point.is_zero() {
+            return point;
+        }
+    }
 }
 
 fn binding_forms<F: Field>(
@@ -126,7 +139,7 @@ mod tests {
         protocols::params::{
             FoldingFactor, Mode, PowBudget, ProtocolConfig, RateSchedule, SecuritySpec, TuningSpec,
         },
-        transcript::{codecs::Empty, DomainSeparator},
+        transcript::{codecs::Empty, DomainSeparator, MockSponge},
     };
 
     fn config() -> ProtocolConfig<Basefield<Field64_2>> {
@@ -142,6 +155,39 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    #[test]
+    fn binding_resamples_zero_and_preserves_transcript_agreement() {
+        let config = config();
+        let layout = config.joint_masks().unwrap();
+        let mut coefficients = vec![Field64_2::ZERO; layout.commit().vector_size()];
+        coefficients[layout.basefield_blinder().start] = Field64_2::ONE;
+        let ds = DomainSeparator::protocol(&"zook-binding-test")
+            .session(&"zero challenges")
+            .instance(&Empty);
+        let mut repr = <Field64_2 as Decoding<[u8]>>::Repr::default();
+        let challenge_bytes = repr.as_mut().len();
+        for zeros in [0, 1, 3] {
+            // Decode little-endian 7 after the rejected zero field elements.
+            let mut squeeze = vec![0; (zeros + 1) * challenge_bytes];
+            squeeze[zeros * challenge_bytes] = 7;
+            squeeze.push(42);
+            let sponge = MockSponge {
+                absorb: None,
+                squeeze: &squeeze,
+            };
+            let mut ps = ProverState::new(&ds, sponge.clone());
+            let binding = prove_binding(layout, &coefficients, 1, &mut ps);
+            assert_eq!(binding.forms, binding_forms(layout, Field64_2::from(7), 1));
+            assert_ne!(binding.values[1], Field64_2::ZERO);
+            assert_eq!(ps.verifier_message::<u8>(), 42);
+            let proof = ps.proof();
+            let mut vs = VerifierState::new(&ds, &proof, sponge);
+            assert_eq!(receive_binding(layout, 1, &mut vs).unwrap(), binding);
+            assert_eq!(vs.verifier_message::<u8>(), 42);
+            vs.check_eof().unwrap();
+        }
     }
 
     #[test]
@@ -204,7 +250,7 @@ mod tests {
             .instance(&Empty);
         for changed in 0..2 {
             let mut ps = ProverState::new_std(&ds);
-            let point = ps.verifier_message();
+            let point = binding_challenge(&mut ps);
             let forms = binding_forms(layout, point, 1);
             for (index, form) in forms[..2].iter().enumerate() {
                 let mut value = form.evaluate(&Identity::new(), &coefficients);

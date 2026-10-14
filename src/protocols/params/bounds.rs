@@ -82,6 +82,7 @@ mod tests {
         assert!(zero_error.is_infinite() && zero_error.is_sign_negative());
         assert_close(log2_sum(f64::NEG_INFINITY, -80.0), -80.0);
         assert!((log2_sum(-2000.0, -2000.0) + 1999.0).abs() < 1e-12);
+        assert!((out_of_domain_bits(8.0, 1).unwrap() - 255.0_f64.log2()).abs() < 1e-12);
         assert!((out_of_domain_bits(8.0, 128).unwrap() - 7.0).abs() < 1e-12);
         assert_eq!(
             out_of_domain_bits(8.0, 256),
