@@ -1,5 +1,7 @@
 //! Sumcheck configuration and per-step security.
 
+use ark_ff::Field;
+
 use crate::{
     algebra::{embedding::Embedding, fields::FieldWithSize},
     bits::Bits,
@@ -57,6 +59,14 @@ pub fn analytic_error_bits<M: Embedding>(
             .min(polynomial_identity)
             .max(0.0),
     ))
+}
+
+/// A quadratic sumcheck step on a revealed vector fails with probability at most `2 / |F|`.
+///
+/// The vector is fixed before these challenges, so there is no codeword-list factor.
+/// This is the additional reduction after §5.4, “The final opening protocol”.
+pub(super) fn revealed_sumcheck_error_bits<F: Field>() -> Bits {
+    Bits::new((F::field_size_bits() - 1.0).max(0.0))
 }
 
 /// Sparse sumcheck mask length: one constant and two coefficients per variable.

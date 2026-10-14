@@ -15,8 +15,9 @@ use crate::{
             irs_commit::{solve as solve_irs, validate_single_polynomial},
             protocol_config::{BasecasePlan, WitnessMaskConfig},
             regime::constrained_agreement_bits,
+            solved::Solved,
             spec::{Mode, RoundContext, SecuritySpec},
-            sumcheck::analytic_error_bits,
+            sumcheck::{analytic_error_bits, revealed_sumcheck_error_bits},
         },
         proof_of_work::Config as PowConfig,
         sumcheck::{Config as SumcheckConfig, SumcheckMode},
@@ -48,9 +49,21 @@ pub fn solve_with_commit<F: Field>(
     if matches!(spec.mode, Mode::ZeroKnowledge) {
         validate_single_polynomial(&commit)?;
         let witness_mask = WitnessMaskConfig::for_code(&commit, incoming_deep)?;
+        let analytic = revealed_sumcheck_error_bits::<F>();
+        let pow = grind_to_at(spec, analytic, Pow::BasecaseSumcheck)?;
+        let sumcheck = Solved::new(
+            SumcheckConfig::new(
+                commit.vector_size(),
+                pow,
+                commit.vector_size().trailing_zeros() as usize,
+                SumcheckMode::Standard,
+            ),
+            analytic,
+        );
         return Ok(BasecasePlan::ZeroKnowledge {
             commit,
             witness_mask,
+            sumcheck,
         });
     }
     let analytic = analytic_error_bits(&commit, false)?;
@@ -105,7 +118,41 @@ impl ZookFinalOpeningSoundness {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{algebra::fields::Field64_2, protocols::params::test_utils::johnson_code};
+    use crate::{
+        algebra::fields::{Field64, Field64_2, FieldWithSize},
+        protocols::params::{spec::PowBudget, test_utils::johnson_code},
+    };
+
+    #[test]
+    fn final_sumcheck_is_standard_and_receives_no_grinding_credit() {
+        let code = johnson_code::<Identity<Field64_2>>(128, 1, 0.25);
+        let spec = SecuritySpec::new(80).with_mode(Mode::ZeroKnowledge);
+        let BasecasePlan::ZeroKnowledge { sumcheck, .. } =
+            solve_with_commit(&spec, code, 0).unwrap()
+        else {
+            panic!("expected Zook final sumcheck");
+        };
+        assert!(matches!(sumcheck.mode(), SumcheckMode::Standard));
+        assert_eq!(sumcheck.initial_size(), 128);
+        assert_eq!(sumcheck.final_size(), 1);
+        assert_eq!(sumcheck.round_pow(), PowConfig::none());
+        assert_eq!(
+            sumcheck.analytic(),
+            Bits::new(Field64_2::field_size_bits() - 1.0)
+        );
+
+        let code = johnson_code::<Identity<Field64>>(128, 1, 0.25);
+        let spec = SecuritySpec::new(64)
+            .with_mode(Mode::ZeroKnowledge)
+            .with_pow_budget(PowBudget::per_slot(20));
+        assert!(matches!(
+            solve_with_commit(&spec, code, 0),
+            Err(DeriveError::SecurityTargetNotMet {
+                pow: Pow::BasecaseSumcheck,
+                ..
+            })
+        ));
+    }
 
     #[test]
     fn final_queries_lose_one_bit_when_errors_are_equal() {

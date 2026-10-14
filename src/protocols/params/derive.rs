@@ -203,6 +203,31 @@ mod tests {
     }
 
     #[test]
+    fn validates_final_sumcheck_after_deserialization() {
+        let config = ProtocolConfig::<M>::derive(spec(), tuning(4096)).unwrap();
+        for field in ["num_rounds", "initial_size"] {
+            let mut encoded = serde_json::to_value(&config).unwrap();
+            let value = &mut encoded["basecase"]["ZeroKnowledge"]["sumcheck"]["config"][field];
+            assert!(value.as_u64().unwrap() > 0);
+            *value = serde_json::json!(0);
+            let restored: ProtocolConfig<M> = serde_json::from_value(encoded).unwrap();
+            assert!(matches!(
+                restored.validate(),
+                Err(DeriveError::ZookSecurity(
+                    ZookSecurityError::InvalidRoundShape
+                ))
+            ));
+        }
+        let mut encoded = serde_json::to_value(&config).unwrap();
+        encoded["basecase"]["ZeroKnowledge"]["sumcheck"]["analytic"] = serde_json::json!(200.0);
+        let restored: ProtocolConfig<M> = serde_json::from_value(encoded).unwrap();
+        assert!(matches!(
+            restored.validate(),
+            Err(DeriveError::AnalyticDrift { .. })
+        ));
+    }
+
+    #[test]
     fn grinding_budget_does_not_reduce_zook_queries() {
         let config = ProtocolConfig::<M>::derive(spec(), tuning(4096)).unwrap();
         let with_pow = ProtocolConfig::<M>::derive(

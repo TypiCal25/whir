@@ -6,10 +6,7 @@ use ark_ff::Field;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    algebra::{
-        embedding::{Embedding, Identity},
-        fields::FieldWithSize,
-    },
+    algebra::embedding::{Embedding, Identity},
     bits::Bits,
     protocols::{
         basecase::Config as BasecaseConfig,
@@ -24,11 +21,11 @@ use crate::{
             spec::{Mode, SecuritySpec, TuningSpec},
             sumcheck::{
                 analytic_error_bits as sumcheck_error_bits, mask_coefficients,
-                zook_sumcheck_error_bits,
+                revealed_sumcheck_error_bits, zook_sumcheck_error_bits,
             },
         },
         proof_of_work::Config as PowConfig,
-        sumcheck::Config as SumcheckConfig,
+        sumcheck::{Config as SumcheckConfig, SumcheckMode},
     },
 };
 
@@ -103,6 +100,25 @@ impl<M: Embedding> ProtocolConfig<M> {
         usize::from(self.first_round.is_some()) + self.tail_rounds.len()
     }
 
+    /// Mask layout at a witness commitment, including the final commitment.
+    ///
+    /// Index zero selects the initial witness; `num_rounds()` selects the final one.
+    pub fn witness_mask(&self, index: usize) -> Option<WitnessMaskConfig> {
+        assert!(index <= self.num_rounds());
+        if index == self.num_rounds() {
+            self.basecase.witness_mask().copied()
+        } else if index == 0 {
+            self.first_round
+                .as_ref()
+                .and_then(|round| round.masks())
+                .map(|masks| masks.witness)
+        } else {
+            self.tail_rounds[index - 1]
+                .masks()
+                .map(|masks| masks.witness)
+        }
+    }
+
     fn round_views(&self) -> impl Iterator<Item = &dyn RoundMetrics> + '_ {
         self.first_round
             .iter()
@@ -163,6 +179,18 @@ impl<M: Embedding> ProtocolConfig<M> {
         }
         if previous.is_some_and(|commit| commit != self.basecase.commit()) {
             return Err(ZookSecurityError::InvalidRoundShape.into());
+        }
+        if let BasecasePlan::ZeroKnowledge {
+            commit, sumcheck, ..
+        } = &self.basecase
+        {
+            if sumcheck.initial_size() != commit.vector_size()
+                || sumcheck.num_rounds() != commit.vector_size().trailing_zeros() as usize
+                || !matches!(sumcheck.mode(), SumcheckMode::Standard)
+                || sumcheck.round_pow() != PowConfig::none()
+            {
+                return Err(ZookSecurityError::InvalidRoundShape.into());
+            }
         }
         Ok(())
     }
@@ -243,13 +271,21 @@ impl<M: Embedding> ProtocolConfig<M> {
                 recorded: *sumcheck_analytic,
                 recompute: sumcheck_error_bits(config.commit(), false)?,
             }),
-            BasecasePlan::ZeroKnowledge { commit, .. } => {
+            BasecasePlan::ZeroKnowledge {
+                commit, sumcheck, ..
+            } => {
                 let joint = self
                     .joint_masks
                     .as_ref()
                     .ok_or(DeriveError::InvalidMaskLayout)?;
                 let opening = ZookFinalOpeningSoundness::for_codes(commit, &joint.commit)?;
                 slots.extend([
+                    PowSlot {
+                        kind: Pow::BasecaseSumcheck,
+                        pow: sumcheck.round_pow(),
+                        recorded: sumcheck.analytic(),
+                        recompute: revealed_sumcheck_error_bits::<M::Target>(),
+                    },
                     PowSlot {
                         kind: Pow::JointMaskBinding,
                         pow: PowConfig::none(),
@@ -568,6 +604,8 @@ pub enum BasecasePlan<F: Field> {
     ZeroKnowledge {
         commit: IrsConfig<Identity<F>>,
         witness_mask: WitnessMaskConfig,
+        /// Reduce the revealed combined witness against the implicit kernel.
+        sumcheck: Solved<SumcheckConfig<F>>,
     },
 }
 
@@ -587,12 +625,12 @@ impl<F: Field> BasecasePlan<F> {
             Self::ZeroKnowledge { witness_mask, .. } => Some(witness_mask),
         }
     }
-    fn analytic_bits(&self) -> Bits {
+    const fn analytic_bits(&self) -> Bits {
         match self {
             Self::Standard {
                 sumcheck_analytic, ..
             } => *sumcheck_analytic,
-            Self::ZeroKnowledge { .. } => Bits::new(F::field_size_bits()),
+            Self::ZeroKnowledge { sumcheck, .. } => sumcheck.analytic(),
         }
     }
 }
@@ -626,7 +664,7 @@ impl<F: Field> JointMaskConfig<F> {
     pub const fn blinder(&self) -> &Range<usize> {
         &self.blinder
     }
-    /// Target-field coefficients blinding the source-field membership check.
+    /// Membership-check blinder sampled in the initial witness commitment's field.
     pub const fn basefield_blinder(&self) -> &Range<usize> {
         &self.basefield_blinder
     }
@@ -712,7 +750,10 @@ impl ZookRoundSoundness {
 mod tests {
     use super::*;
     use crate::{
-        algebra::{embedding::Basefield, fields::Field64_2},
+        algebra::{
+            embedding::Basefield,
+            fields::{Field64_2, FieldWithSize},
+        },
         protocols::params::{
             mask_proximity::zook_mask_binding_bits,
             test_utils::{assert_probability_bits, johnson_code},
