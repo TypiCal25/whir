@@ -188,11 +188,6 @@ impl<M: Embedding> Config<M> {
         self.pow
     }
 
-    #[cfg(test)]
-    pub(crate) const fn target_mut_for_test(&mut self) -> &mut IrsConfig<Identity<M::Target>> {
-        &mut self.target
-    }
-
     /// Mask oracle length `ℓ_zk`. Returns 0 in Standard mode.
     pub const fn message_mask_length(&self) -> usize {
         match &self.mode {
