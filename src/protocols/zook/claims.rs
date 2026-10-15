@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     algebra::{
-        embedding::Identity,
+        embedding::{Identity, PublicScalar},
         linear_form::{Covector, Evaluate},
     },
     protocols::{
@@ -81,19 +81,21 @@ impl<F: Field> MaskClaims<F> {
         assert_eq!(range.len(), 2 * rounds + 1);
         // Sumcheck configuration requires odd characteristic. No inverse of a
         // transcript challenge is needed, including when lambda is zero.
-        let scale = opening.mask_rlc / F::from(2).pow([rounds as u64]);
+        let divisor = F::BasePrimeField::from(2).pow([rounds as u64]);
+        let inverse = F::BasePrimeField::ONE / divisor;
+        let scale = opening.mask_rlc.mul_by_base_prime_field(&inverse);
         for weight in &mut self.covector.vector {
             *weight *= scale;
         }
-        let scale = F::from(remaining_size as u64);
+        let scale = F::BasePrimeField::from(remaining_size as u64);
         let weights = &mut self.covector.vector[range];
-        weights[0] += scale;
+        weights[0] += F::from_base_prime_field(scale);
         for (pair, &challenge) in weights[1..]
             .chunks_exact_mut(2)
             .zip(&opening.round_challenges)
         {
-            pair[0] += scale * challenge;
-            pair[1] += scale * challenge.square();
+            pair[0] += challenge.mul_by_base_prime_field(&scale);
+            pair[1] += challenge.square().mul_by_base_prime_field(&scale);
         }
     }
 
@@ -112,8 +114,11 @@ impl<F: Field> MaskClaims<F> {
         mut kernel_at: impl FnMut(usize) -> F,
     ) {
         assert_eq!(update.ood_rlc_coeffs.len(), update.ood_eval_points.len());
-        for weight in &mut self.covector.vector {
-            *weight *= update.original_sl_coeff;
+        if !update.original_sl_coeff.is_one() {
+            let scale = PublicScalar::new(update.original_sl_coeff);
+            for weight in &mut self.covector.vector {
+                *weight = scale.mul(*weight);
+            }
         }
         self.subtract_witness_mask(range, mask, message_length, |index| {
             let deep: F = update
@@ -139,15 +144,15 @@ pub(super) fn sumcheck_blinding<F: Field>(
     remaining_size: usize,
 ) -> Zeroizing<Vec<F>> {
     assert!(coefficients.len() >= 3 && coefficients.len() % 2 == 1);
-    let scale = F::from(remaining_size as u64);
+    let scale = F::BasePrimeField::from(remaining_size as u64);
     let mut expanded = Zeroizing::new(vec![F::ZERO; 3 * (coefficients.len() / 2)]);
-    expanded[0] = scale * coefficients[0];
+    expanded[0] = coefficients[0].mul_by_base_prime_field(&scale);
     for (mask, pair) in expanded
         .chunks_exact_mut(3)
         .zip(coefficients[1..].chunks_exact(2))
     {
-        mask[1] = scale * pair[0];
-        mask[2] = scale * pair[1];
+        mask[1] = pair[0].mul_by_base_prime_field(&scale);
+        mask[2] = pair[1].mul_by_base_prime_field(&scale);
     }
     expanded
 }

@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 use tracing::instrument;
 
 use crate::{
-    algebra::{embedding::Embedding, univariate_evaluate},
+    algebra::{
+        embedding::{Embedding, PublicScalar},
+        univariate_evaluate,
+    },
     buffer::{Buffer, BufferMath, BufferOps},
     protocols::proof_of_work,
     transcript::{
@@ -210,7 +213,7 @@ impl<F: Field> Config<F> {
         assert_eq!(b.len(), self.initial_size);
         debug_assert_eq!(a.mixed_dot(embedding, b), *sum);
         assert_eq!(masks.len(), self.num_rounds * self.mask_length());
-        let half = F::from(2).inverse().unwrap();
+        let half = F::BasePrimeField::ONE / F::BasePrimeField::from(2);
         let polynomial_len = self.mask_length().max(3);
 
         // First fold: `a` crosses from the source to the target field. When
@@ -230,7 +233,8 @@ impl<F: Field> Config<F> {
         let (mut mask_sum, mask_rlc) = self.maybe_send_initial_mask_sum(prover_state, masks);
         // Each Boolean sum counts a constant twice, so the recurrence below
         // halves this contribution on every fold without changing the dot sum.
-        mask_sum += mask_rlc * carried_sum;
+        let mask_scale = PublicScalar::new(mask_rlc);
+        mask_sum += mask_scale.mul(carried_sum);
 
         let mut univariate = Vec::with_capacity(polynomial_len);
         let mut round_challenges = Vec::with_capacity(self.num_rounds);
@@ -263,14 +267,16 @@ impl<F: Field> Config<F> {
             // With no masks or carried sum, this reduces to `[c0, c1, c2]`.
             univariate.clear();
             univariate.resize(polynomial_len, F::ZERO);
-            let sum_multiple = F::from(1 << self.num_rounds.saturating_sub(round + 1));
+            let sum_multiple =
+                F::BasePrimeField::from(1 << self.num_rounds.saturating_sub(round + 1));
             for (u, m) in univariate.iter_mut().zip(mask.iter()) {
-                *u = sum_multiple * *m;
+                *u = m.mul_by_base_prime_field(&sum_multiple);
             }
-            univariate[0] += (mask_sum - sum_multiple * eval_01(mask)) * half;
-            univariate[0] += mask_rlc * c0;
-            univariate[1] += mask_rlc * c1;
-            univariate[2] += mask_rlc * c2;
+            univariate[0] += (mask_sum - eval_01(mask).mul_by_base_prime_field(&sum_multiple))
+                .mul_by_base_prime_field(&half);
+            univariate[0] += mask_scale.mul(c0);
+            univariate[1] += mask_scale.mul(c1);
+            univariate[2] += mask_scale.mul(c2);
 
             prover_state.prover_message(&univariate[0]);
             prover_state.prover_messages(&univariate[2..]);
@@ -281,7 +287,7 @@ impl<F: Field> Config<F> {
             round_challenges.push(r);
             *sum = (c2 * r + c1) * r + c0;
 
-            mask_sum = univariate_evaluate(&univariate, r) - mask_rlc * *sum;
+            mask_sum = univariate_evaluate(&univariate, r) - mask_scale.mul(*sum);
             prev_round_challenge = Some(r);
         }
         // Final fold of the inputs (no polynomial computation).
@@ -305,7 +311,7 @@ impl<F: Field> Config<F> {
             (Some(_), None) => unreachable!("folded buffer implies a prior challenge"),
         };
 
-        *sum = mask_sum + mask_rlc * *sum;
+        *sum = mask_sum + mask_scale.mul(*sum);
         (
             a_folded,
             SumcheckOpening {
@@ -331,12 +337,12 @@ impl<F: Field> Config<F> {
                 if self.num_rounds == 0 {
                     return (F::ZERO, F::ONE);
                 }
-                let sum_multiple = F::from(1 << self.num_rounds.saturating_sub(1));
+                let sum_multiple = F::BasePrimeField::from(1 << self.num_rounds.saturating_sub(1));
                 let mask_sum = masks
                     .chunks_exact(mask_length.get())
                     .map(eval_01)
                     .sum::<F>()
-                    * sum_multiple;
+                    .mul_by_base_prime_field(&sum_multiple);
                 prover_state.prover_message(&mask_sum);
                 let mask_rlc = prover_state.verifier_message();
                 (mask_sum, mask_rlc)
@@ -407,7 +413,7 @@ impl<F: Field> Config<F> {
                 }
                 let mask_sum: F = verifier_state.prover_message()?;
                 let mask_rlc = verifier_state.verifier_message();
-                *sum = mask_sum + mask_rlc * *sum;
+                *sum = mask_sum + PublicScalar::new(mask_rlc).mul(*sum);
                 Ok(mask_rlc)
             }
         }

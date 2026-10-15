@@ -6,7 +6,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     algebra::{
-        embedding::{Embedding, Identity},
+        embedding::{Embedding, Identity, PublicScalar},
         geometric_accumulate, geometric_sequence,
         linear_form::{LinearForm, UnivariateEvaluation},
     },
@@ -134,7 +134,7 @@ impl<F: Field> Kernel<'_, F> {
         let points: Vec<_> = self.terms.iter().map(|term| term.form.point).collect();
         let strides: Vec<_> = points
             .iter()
-            .map(|x| x.pow([message_length as u64]))
+            .map(|&x| PublicScalar::new(x).pow(message_length as u64))
             .collect();
         let mut scalars: Vec<_> = self
             .terms
@@ -144,7 +144,7 @@ impl<F: Field> Kernel<'_, F> {
         for prefix in coefficients.chunks_exact_mut(mask.coefficients_per_polynomial) {
             geometric_accumulate(prefix, scalars.clone(), &points);
             for (scalar, stride) in scalars.iter_mut().zip(&strides) {
-                *scalar *= stride;
+                *scalar = stride.mul(*scalar);
             }
         }
         coefficients
