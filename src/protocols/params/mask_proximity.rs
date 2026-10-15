@@ -76,6 +76,7 @@ pub(super) fn solve<F: Field>(
 ///
 /// NTT rounding can lower the effective rate, so it cannot require more queries
 /// than this reservation. Actual query counts determine the stored mask ranges.
+/// Only the codeword length needs NTT rounding; the mask message is not folded.
 pub(super) fn solve_commit<F: Field>(
     spec: &SecuritySpec,
     payload_length: usize,
@@ -91,7 +92,6 @@ pub(super) fn solve_commit<F: Field>(
         .checked_add(queries)
         .and_then(|n| n.checked_add(1))
         .and_then(|n| n.checked_add(extension_degree))
-        .and_then(usize::checked_next_power_of_two)
         .ok_or(DeriveError::SizeOverflow)?;
     solve_irs(
         spec,
@@ -135,9 +135,25 @@ pub fn zook_mask_binding_bits<F: Field>(
 mod tests {
     use super::*;
     use crate::{
-        algebra::fields::Field64_2,
-        protocols::params::test_utils::{assert_probability_bits, johnson_code},
+        algebra::fields::{Field64_2, Field64_3},
+        protocols::params::{
+            spec::{Mode, PowBudget},
+            test_utils::{assert_probability_bits, johnson_code},
+        },
     };
+
+    #[test]
+    fn mask_message_keeps_its_length_when_codeword_is_rounded() {
+        let spec = SecuritySpec::new(128)
+            .with_mode(Mode::ZeroKnowledge)
+            .with_pow_budget(PowBudget::Forbidden);
+        let commit = solve_commit::<Field64_3>(&spec, 4495, 3).unwrap();
+        assert_eq!(commit.vector_size(), 4566);
+        assert!(commit.codeword_length() >= 16 * commit.vector_size());
+        assert!(4495 + commit.in_domain_samples() + 1 + 3 <= commit.vector_size());
+        validate_single_polynomial(&commit).unwrap();
+        assert!(zook_mask_binding_bits(&commit).unwrap() >= Bits::from(128.0));
+    }
 
     #[test]
     fn mask_binding_includes_frobenius_error() {
