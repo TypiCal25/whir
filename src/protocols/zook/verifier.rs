@@ -2,6 +2,8 @@
 
 use ark_ff::{Field, Zero};
 use ark_std::rand::{distributions::Standard, prelude::Distribution};
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 #[cfg(feature = "tracing")]
 use tracing::instrument;
 
@@ -157,23 +159,36 @@ where
     assert_eq!(config.mask_length(), 0);
     let evaluations = config.verify(vs, &commitments)?;
     let weights = [F::ONE, lambda];
-    for (&point, value) in zip_strict(&evaluations.points, evaluations.values(&weights)) {
-        verify!(univariate_evaluate(message, point) == value);
+    let values = evaluate_points(message, &evaluations.points);
+    for (actual, expected) in zip_strict(values, evaluations.values(&weights)) {
+        verify!(actual == expected);
     }
     Ok(())
+}
+
+/// Evaluate independent queries in one batch, preserving their order.
+fn evaluate_points<F: Field>(message: &[F], points: &[F]) -> Vec<F> {
+    #[cfg(feature = "parallel")]
+    let points = points.par_iter();
+    #[cfg(not(feature = "parallel"))]
+    let points = points.iter();
+    points
+        .map(|&point| univariate_evaluate(message, point))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use std::panic::{catch_unwind, AssertUnwindSafe};
 
+    use ark_ff::AdditiveGroup;
     use ark_std::rand::{rngs::StdRng, SeedableRng};
 
     use super::*;
     use crate::{
         algebra::{
             embedding::Basefield,
-            fields::Field64_2,
+            fields::{Field64_2, Field64_3},
             linear_form::{MultilinearExtension, UnivariateEvaluation},
             random_vector,
         },
@@ -183,6 +198,30 @@ mod tests {
         },
         transcript::{codecs::Empty, DomainSeparator, ProverState},
     };
+
+    #[test]
+    fn batched_evaluations_preserve_query_order_and_duplicates() {
+        type F = Field64_3;
+        let mut rng = StdRng::seed_from_u64(121);
+        let mut points = random_vector::<F>(&mut rng, 67);
+        points[0] = F::ZERO;
+        points[1] = F::ONE;
+        points[2] = points[4];
+        for size in [0, 1, 3, 8192] {
+            let message = random_vector::<F>(&mut rng, size);
+            let expected: Vec<_> = points
+                .iter()
+                .map(|point| {
+                    message
+                        .iter()
+                        .rev()
+                        .fold(F::ZERO, |value, coefficient| value * point + coefficient)
+                })
+                .collect();
+            assert_eq!(evaluate_points(&message, &points), expected);
+            assert!(evaluate_points(&message, &[]).is_empty());
+        }
+    }
 
     fn check_final_opening(mutate: impl Fn(&mut VerifierRoundState<'_, Field64_2>), accept: bool) {
         for size in [8_usize, 4096] {
