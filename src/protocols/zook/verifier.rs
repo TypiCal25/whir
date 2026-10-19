@@ -219,7 +219,7 @@ mod tests {
                 })
                 .collect();
             assert_eq!(evaluate_points(&message, &points), expected);
-            assert!(evaluate_points(&message, &[]).is_empty());
+            assert_eq!(evaluate_points(&message, &[]), Vec::<F>::new());
         }
     }
 
