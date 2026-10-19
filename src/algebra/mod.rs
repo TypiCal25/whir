@@ -189,41 +189,72 @@ pub fn mixed_dot<F: Field, G: Field>(
 }
 
 /// Compute `accumulator[i] += sum_j scalars[j] * points[j]^i`
-pub fn geometric_accumulate<F: Field>(accumulator: &mut [F], scalars: Vec<F>, points: &[F]) {
+pub fn geometric_accumulate<F: Field>(accumulator: &mut [F], mut scalars: Vec<F>, points: &[F]) {
+    assert_eq!(scalars.len(), points.len());
     if F::extension_degree() == 1 {
-        return mixed_geometric_accumulate(&Identity::new(), accumulator, scalars, points);
+        return mixed_geometric_accumulate(&Identity::new(), accumulator, &mut scalars, points);
     }
-    let mut base_points = Vec::with_capacity(points.len());
-    let mut base_scalars = Vec::with_capacity(points.len());
-    let mut extension_points = Vec::new();
-    let mut extension_scalars = Vec::new();
-    for (scalar, &point) in scalars.into_iter().zip(points) {
-        if let Some(point) = project_base_field(point) {
-            base_points.push(point);
-            base_scalars.push(scalar);
-        } else {
-            extension_points.push(point);
-            extension_scalars.push(scalar);
+    GeometricAccumulator::new(points).accumulate(accumulator, &scalars);
+}
+
+/// Reuse point classification and scalar scratch across geometric accumulations.
+pub(crate) struct GeometricAccumulator<F: Field> {
+    base_points: Vec<F::BasePrimeField>,
+    extension_points: Vec<F>,
+    indices: Vec<usize>,
+    scratch: Vec<F>,
+}
+
+impl<F: Field> GeometricAccumulator<F> {
+    pub(crate) fn new(points: &[F]) -> Self {
+        let mut base_points = Vec::new();
+        let mut extension_points = Vec::new();
+        let mut indices = Vec::with_capacity(points.len());
+        let mut extension_indices = Vec::new();
+        for (index, &point) in points.iter().enumerate() {
+            if let Some(point) = project_base_field(point) {
+                base_points.push(point);
+                indices.push(index);
+            } else {
+                extension_points.push(point);
+                extension_indices.push(index);
+            }
+        }
+        indices.extend(extension_indices);
+        Self {
+            base_points,
+            extension_points,
+            indices,
+            scratch: vec![F::ZERO; points.len()],
         }
     }
-    mixed_geometric_accumulate(
-        &Basefield::<F>::new(),
-        accumulator,
-        base_scalars,
-        &base_points,
-    );
-    mixed_geometric_accumulate(
-        &Identity::new(),
-        accumulator,
-        extension_scalars,
-        &extension_points,
-    );
+
+    /// Add `sum_j scalars[j] * points[j]^i` at each index `i`, starting at zero.
+    pub(crate) fn accumulate(&mut self, accumulator: &mut [F], scalars: &[F]) {
+        assert_eq!(scalars.len(), self.indices.len());
+        for (scratch, &index) in self.scratch.iter_mut().zip(&self.indices) {
+            *scratch = scalars[index];
+        }
+        let (base_scalars, extension_scalars) = self.scratch.split_at_mut(self.base_points.len());
+        mixed_geometric_accumulate(
+            &Basefield::<F>::new(),
+            accumulator,
+            base_scalars,
+            &self.base_points,
+        );
+        mixed_geometric_accumulate(
+            &Identity::new(),
+            accumulator,
+            extension_scalars,
+            &self.extension_points,
+        );
+    }
 }
 
 fn mixed_geometric_accumulate<M: Embedding>(
     embedding: &M,
     accumulator: &mut [M::Target],
-    mut scalars: Vec<M::Target>,
+    scalars: &mut [M::Target],
     points: &[M::Source],
 ) {
     if points.is_empty() {
@@ -233,14 +264,14 @@ fn mixed_geometric_accumulate<M: Embedding>(
     if accumulator.len() > workload_size::<M::Target>() {
         let half = accumulator.len() / 2;
         let (low, high) = accumulator.split_at_mut(half);
-        let scalars_high = scalars
+        let mut scalars_high: Vec<_> = scalars
             .iter()
             .zip(points)
             .map(|(s, x)| embedding.mixed_mul(*s, x.pow([half as u64])))
             .collect();
         rayon::join(
             || mixed_geometric_accumulate(embedding, low, scalars, points),
-            || mixed_geometric_accumulate(embedding, high, scalars_high, points),
+            || mixed_geometric_accumulate(embedding, high, &mut scalars_high, points),
         );
         return;
     }
@@ -290,21 +321,27 @@ mod tests {
             }
             for queries in [0, 3, points.len()] {
                 let points = &points[..queries];
-                let scalars = random_vector::<F>(&mut rng, points.len());
-                let mut actual = coefficients.clone();
-                let expected: Vec<_> = coefficients
-                    .iter()
-                    .enumerate()
-                    .map(|(i, &c)| {
-                        c + scalars
-                            .iter()
-                            .zip(points)
-                            .map(|(&s, &p)| s * p.pow([i as u64]))
-                            .sum::<F>()
-                    })
-                    .collect();
-                geometric_accumulate(&mut actual, scalars, points);
-                assert_eq!(actual, expected);
+                let mut accumulation = GeometricAccumulator::new(points);
+                for _ in 0..3 {
+                    let scalars = random_vector::<F>(&mut rng, points.len());
+                    let mut actual = coefficients.clone();
+                    let expected: Vec<_> = coefficients
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &c)| {
+                            c + scalars
+                                .iter()
+                                .zip(points)
+                                .map(|(&s, &p)| s * p.pow([i as u64]))
+                                .sum::<F>()
+                        })
+                        .collect();
+                    geometric_accumulate(&mut actual, scalars.clone(), points);
+                    assert_eq!(actual, expected);
+                    let mut reused = coefficients.clone();
+                    accumulation.accumulate(&mut reused, &scalars);
+                    assert_eq!(reused, expected);
+                }
             }
         }
     }

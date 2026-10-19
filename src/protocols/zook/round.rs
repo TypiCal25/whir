@@ -1,5 +1,7 @@
 //! Joint-mask claim reduction through Zook folding rounds.
 
+use std::any::Any;
+
 use ark_ff::{AdditiveGroup, Field};
 use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, RngCore};
 use zeroize::Zeroizing;
@@ -7,8 +9,9 @@ use zeroize::Zeroizing;
 use crate::{
     algebra::{
         embedding::{Embedding, Identity, PublicScalar},
-        geometric_accumulate, geometric_sequence,
-        linear_form::{LinearForm, UnivariateEvaluation},
+        eq_weights, geometric_sequence,
+        linear_form::{LinearForm, MultilinearExtension, UnivariateEvaluation},
+        scalar_mul_add, GeometricAccumulator,
     },
     buffer::{Buffer, BufferMath, BufferOps},
     hash::Hash,
@@ -81,21 +84,23 @@ struct KernelTerm<F: Field> {
 
 impl<F: Field> Kernel<'_, F> {
     /// A coefficient of the current folded kernel, in most-significant-bit order.
-    pub(super) fn coefficient(&self, index: usize) -> F {
+    #[cfg(test)]
+    fn coefficient(&self, index: usize) -> F {
         assert!(index < self.size);
-        let point: Vec<_> = (0..self.size.trailing_zeros())
-            .rev()
-            .map(|bit| F::from(((index >> bit) & 1) as u64))
+        let point: Vec<_> = self
+            .challenges
+            .iter()
+            .copied()
+            .chain(
+                (0..self.size.trailing_zeros())
+                    .rev()
+                    .map(|bit| F::from(((index >> bit) & 1) as u64)),
+            )
             .collect();
-        self.evaluate(&point)
-    }
-
-    pub(super) fn evaluate(&self, suffix: &[F]) -> F {
-        assert_eq!(suffix.len(), self.size.trailing_zeros() as usize);
-        let point: Vec<_> = self.challenges.iter().chain(suffix).copied().collect();
         self.initial_contribution(&point) + self.query_contribution(&point)
     }
 
+    #[cfg(test)]
     fn initial_contribution(&self, point: &[F]) -> F {
         let initial: F = self
             .forms
@@ -106,26 +111,83 @@ impl<F: Field> Kernel<'_, F> {
         self.initial_scale * initial
     }
 
+    /// Accumulate a multilinear form using the tensor product of polynomial and prefix weights.
+    ///
+    /// For polynomial index `p` and coefficient index `c`, the weight factors as
+    /// `scalar * eq(folded, self.challenges) * eq(polynomial, bits(p)) * eq(message, bits(c))`,
+    /// where `bits` lists bits most significant first and `eq(a, b) = ∏(a_i*b_i + (1-a_i)*(1-b_i))`.
+    fn accumulate_multilinear_mask(
+        &self,
+        form: &MultilinearExtension<F>,
+        mask: WitnessMaskConfig,
+        scalar: F,
+        coefficients: &mut [F],
+    ) {
+        let dimensions = self.challenges.len() + self.size.trailing_zeros() as usize;
+        // Zero coordinates encode the form's implicit leading padding dimensions.
+        let mut point = vec![F::ZERO; dimensions - form.point.len()];
+        point.extend_from_slice(&form.point);
+        let (folded, remaining) = point.split_at(self.challenges.len());
+        let scalar =
+            scalar * MultilinearExtension::new(folded.to_vec()).mle_evaluate(&self.challenges);
+        let (polynomial, message) =
+            remaining.split_at(mask.num_polynomials.trailing_zeros() as usize);
+        let prefix_dimensions = mask.coefficients_per_polynomial.next_power_of_two().ilog2();
+        let (zero_prefix, varying) = message.split_at(message.len() - prefix_dimensions as usize);
+        let scalar = zero_prefix
+            .iter()
+            .fold(scalar, |weight, &r| weight * (F::ONE - r));
+        // Indices in the masked prefix have zero high bits. Expand only its low
+        // coordinates, allocating fewer than twice the requested coefficients.
+        let prefix = eq_weights(varying);
+        let polynomial_weights = eq_weights(polynomial);
+        for (chunk, weight) in coefficients
+            .chunks_exact_mut(mask.coefficients_per_polynomial)
+            .zip(polynomial_weights)
+        {
+            scalar_mul_add(chunk, scalar * weight, &prefix[..chunk.len()]);
+        }
+    }
+
+    fn initial_mask_coefficients(&self, mask: WitnessMaskConfig) -> Vec<F> {
+        let message_length = self.size / mask.num_polynomials;
+        let dimensions = self.size.trailing_zeros() as usize;
+        let mut point = self.challenges.clone();
+        point.resize(point.len() + dimensions, F::ZERO);
+        let mut coefficients =
+            vec![F::ZERO; mask.num_polynomials * mask.coefficients_per_polynomial];
+        for (&form, &weight) in self.forms.iter().zip(&self.claim_weights) {
+            let scalar = self.initial_scale * weight;
+            if let Some(form) = (form as &dyn Any).downcast_ref::<MultilinearExtension<F>>() {
+                self.accumulate_multilinear_mask(form, mask, scalar, &mut coefficients);
+                continue;
+            }
+            for (polynomial, chunk) in coefficients
+                .chunks_exact_mut(mask.coefficients_per_polynomial)
+                .enumerate()
+            {
+                for (coefficient, value) in chunk.iter_mut().enumerate() {
+                    let index = polynomial * message_length + coefficient;
+                    for (bit, coordinate) in
+                        point[self.challenges.len()..].iter_mut().rev().enumerate()
+                    {
+                        *coordinate = F::from(((index >> bit) & 1) as u64);
+                    }
+                    *value += scalar * evaluate_padded(form, &point);
+                }
+            }
+        }
+        coefficients
+    }
+
     /// Evaluate only the masked prefix of each interleaved polynomial.
     fn mask_coefficients(&self, mask: WitnessMaskConfig) -> Vec<F> {
         assert_eq!(self.size % mask.num_polynomials, 0);
         let message_length = self.size / mask.num_polynomials;
         assert!(mask.coefficients_per_polynomial <= message_length);
-        let dimensions = self.size.trailing_zeros() as usize;
+        let mut coefficients = self.initial_mask_coefficients(mask);
         let mut point = self.challenges.clone();
-        point.resize(point.len() + dimensions, F::ZERO);
-        let mut coefficients =
-            Vec::with_capacity(mask.num_polynomials * mask.coefficients_per_polynomial);
-        for polynomial in 0..mask.num_polynomials {
-            for coefficient in 0..mask.coefficients_per_polynomial {
-                let index = polynomial * message_length + coefficient;
-                for (bit, coordinate) in point[self.challenges.len()..].iter_mut().rev().enumerate()
-                {
-                    *coordinate = F::from(((index >> bit) & 1) as u64);
-                }
-                coefficients.push(self.initial_contribution(&point));
-            }
-        }
+        point.resize(point.len() + self.size.trailing_zeros() as usize, F::ZERO);
 
         // A folded query term has coefficients a*x^i. Evaluate a at the zero
         // suffix once, then advance by x within a prefix and by x^message_length
@@ -141,8 +203,9 @@ impl<F: Field> Kernel<'_, F> {
             .iter()
             .map(|term| term.weight * term.form.mle_evaluate(&point[term.challenge_offset..]))
             .collect();
+        let mut accumulation = GeometricAccumulator::new(&points);
         for prefix in coefficients.chunks_exact_mut(mask.coefficients_per_polynomial) {
-            geometric_accumulate(prefix, scalars.clone(), &points);
+            accumulation.accumulate(prefix, &scalars);
             for (scalar, stride) in scalars.iter_mut().zip(&strides) {
                 *scalar = stride.mul(*scalar);
             }
@@ -372,11 +435,16 @@ where
     ) {
         (Some(layout), Some(mask), Some(joint), Some(binding)) => {
             let mut claims = MaskClaims::new(layout.commit().vector_size());
+            let coefficients = kernel.mask_coefficients(mask);
+            let message_length = config.padded_vector_size() / mask.num_polynomials;
             claims.subtract_witness_mask(
                 layout.witness_masks()[0].clone(),
                 mask,
-                config.padded_vector_size() / mask.num_polynomials,
-                |index| kernel.coefficient(index),
+                message_length,
+                |index| {
+                    coefficients[index / message_length * mask.coefficients_per_polynomial
+                        + index % message_length]
+                },
             );
             Some(VerifierMasks {
                 joint,
@@ -571,8 +639,8 @@ mod tests {
     use crate::{
         algebra::{
             embedding::Basefield,
-            fields::Field64_2,
-            linear_form::{Covector, Evaluate, MultilinearExtension},
+            fields::{Field64, Field64_2, Field64_3},
+            linear_form::{Covector, Evaluate},
             random_vector, univariate_evaluate,
         },
         protocols::params::{
@@ -583,12 +651,26 @@ mod tests {
 
     #[test]
     fn mask_prefixes_match_individual_kernel_coefficients() {
-        type F = Field64_2;
+        check_mask_prefixes::<Field64>();
+        check_mask_prefixes::<Field64_2>();
+        check_mask_prefixes::<Field64_3>();
+    }
+
+    fn check_mask_prefixes<F: Field>()
+    where
+        Standard: Distribution<F>,
+    {
         let mut rng = StdRng::seed_from_u64(71);
         let dense = Covector::new(random_vector::<F>(&mut rng, 32));
         let short = UnivariateEvaluation::new(F::from(7), 3);
         let mle = MultilinearExtension::new(random_vector::<F>(&mut rng, 4));
-        let forms: [&dyn LinearForm<F>; 3] = [&dense, &short, &mle];
+        let zero = MultilinearExtension::new(vec![F::ZERO; 4]);
+        let one = MultilinearExtension::new(vec![F::ONE; 4]);
+        let constant = MultilinearExtension::new(Vec::new());
+        let full = MultilinearExtension::new(random_vector::<F>(&mut rng, 6));
+        let empty = Covector::new(Vec::new());
+        let forms: [&dyn LinearForm<F>; 8] =
+            [&dense, &short, &mle, &zero, &one, &constant, &full, &empty];
         let points = [
             F::ZERO,
             F::ONE,
@@ -604,13 +686,13 @@ mod tests {
             for scale in [F::ZERO, F::ONE, F::from(11)] {
                 let mut kernel = Kernel {
                     forms: &forms,
-                    claim_weights: vec![F::ONE, F::from(3), F::from(5)],
+                    claim_weights: (1..=forms.len()).map(|i| F::from(i as u64)).collect(),
                     challenges: Vec::new(),
                     initial_scale: F::from(3),
                     size: 64,
                     terms: Vec::new(),
                 };
-                for stage in 0..=3 {
+                for challenge in challenges.iter().copied().map(Some).chain([None]) {
                     // Check both an empty query set and terms inserted after
                     // different numbers of folds, including zero query weights.
                     assert_mask_prefixes(&kernel);
@@ -622,9 +704,9 @@ mod tests {
                         });
                     }
                     assert_mask_prefixes(&kernel);
-                    if stage < 3 {
+                    if let Some(challenge) = challenge {
                         kernel.fold(&SumcheckOpening {
-                            round_challenges: challenges[2 * stage..2 * stage + 2].to_vec(),
+                            round_challenges: vec![challenge],
                             mask_rlc: scale,
                         });
                     }
@@ -633,7 +715,7 @@ mod tests {
         }
     }
 
-    fn assert_mask_prefixes(kernel: &Kernel<Field64_2>) {
+    fn assert_mask_prefixes<F: Field>(kernel: &Kernel<F>) {
         for log_polynomials in 0..=kernel.size.trailing_zeros() {
             let num_polynomials = 1 << log_polynomials;
             let message_length = kernel.size / num_polynomials;

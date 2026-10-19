@@ -5,7 +5,7 @@ use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::{
     algebra::{
-        embedding::Identity,
+        embedding::{Embedding, Frobenius, Identity},
         linear_form::{Covector, Evaluate, UnivariateEvaluation},
     },
     protocols::params::JointMaskConfig,
@@ -48,7 +48,11 @@ where
     ps.prover_message(&membership);
     MaskBinding {
         forms,
-        values: [evaluation, membership, frobenius(membership, source_degree)],
+        values: [
+            evaluation,
+            membership,
+            Frobenius::new(source_degree).map(membership),
+        ],
     }
 }
 
@@ -67,7 +71,11 @@ where
     let membership = vs.prover_message()?;
     Ok(MaskBinding {
         forms: binding_forms(config, point, source_degree),
-        values: [evaluation, membership, frobenius(membership, source_degree)],
+        values: [
+            evaluation,
+            membership,
+            Frobenius::new(source_degree).map(membership),
+        ],
     })
 }
 
@@ -96,7 +104,7 @@ fn binding_forms<F: Field>(
             config.commit().vector_size(),
         )),
         membership_form(config, point),
-        membership_form(config, frobenius(point, source_degree)),
+        membership_form(config, Frobenius::new(source_degree).map(point)),
     ]
 }
 
@@ -115,14 +123,6 @@ fn membership_form<F: Field>(config: &JointMaskConfig<F>, point: F) -> Covector<
         power *= point;
     }
     Covector::new(weights)
-}
-
-/// Apply `x -> x^(p^d)`, where `d` is the source field's degree over its prime field.
-fn frobenius<F: Field>(mut value: F, source_degree: u64) -> F {
-    for _ in 0..source_degree {
-        value.frobenius_map_in_place(1);
-    }
-    value
 }
 
 #[cfg(test)]
@@ -237,7 +237,10 @@ mod tests {
         let forms = binding_forms(layout, point, Field64_2::extension_degree());
         let value = forms[1].evaluate(&Identity::new(), &coefficients);
         assert_eq!(forms[2].evaluate(&Identity::new(), &coefficients), value);
-        assert_eq!(frobenius(value, Field64_2::extension_degree()), value);
+        assert_eq!(
+            Frobenius::new(Field64_2::extension_degree()).map(value),
+            value
+        );
     }
 
     #[test]
