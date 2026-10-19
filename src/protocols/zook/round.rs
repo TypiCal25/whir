@@ -9,9 +9,9 @@ use zeroize::Zeroizing;
 use crate::{
     algebra::{
         embedding::{Embedding, Identity, PublicScalar},
-        eq_weights, geometric_sequence,
+        eq_weights, geometric_accumulate_prefixes, geometric_sequence,
         linear_form::{LinearForm, MultilinearExtension, UnivariateEvaluation},
-        scalar_mul_add, GeometricAccumulator,
+        scalar_mul_add,
     },
     buffer::{Buffer, BufferMath, BufferOps},
     hash::Hash,
@@ -79,6 +79,8 @@ pub(super) struct Kernel<'a, F: Field> {
 struct KernelTerm<F: Field> {
     form: UnivariateEvaluation<F>,
     weight: F,
+    folded_multiplier: F,
+    folded_through: usize,
     challenge_offset: usize,
 }
 
@@ -181,35 +183,38 @@ impl<F: Field> Kernel<'_, F> {
     }
 
     /// Evaluate only the masked prefix of each interleaved polynomial.
-    fn mask_coefficients(&self, mask: WitnessMaskConfig) -> Vec<F> {
+    fn mask_coefficients(&mut self, mask: WitnessMaskConfig) -> Vec<F> {
         assert_eq!(self.size % mask.num_polynomials, 0);
         let message_length = self.size / mask.num_polynomials;
         assert!(mask.coefficients_per_polynomial <= message_length);
         let mut coefficients = self.initial_mask_coefficients(mask);
-        let mut point = self.challenges.clone();
-        point.resize(point.len() + self.size.trailing_zeros() as usize, F::ZERO);
-
-        // A folded query term has coefficients a*x^i. Evaluate a at the zero
-        // suffix once, then advance by x within a prefix and by x^message_length
-        // between polynomial starts. No division is needed, including at x = 0.
-        point[self.challenges.len()..].fill(F::ZERO);
+        for term in &mut self.terms {
+            let challenges = &self.challenges[term.folded_through..];
+            if challenges.is_empty() {
+                continue;
+            }
+            // For k new challenges r_j, a query point x gains the factor
+            // product_j (1 - r_j + r_j * x^(self.size * 2^(k-1-j))).
+            let mut power = PublicScalar::new(term.form.point).pow(self.size as u64);
+            for &challenge in challenges.iter().rev() {
+                term.folded_multiplier *= F::ONE - challenge + power.mul(challenge);
+                power.square();
+            }
+            term.folded_through = self.challenges.len();
+        }
         let points: Vec<_> = self.terms.iter().map(|term| term.form.point).collect();
-        let strides: Vec<_> = points
-            .iter()
-            .map(|&x| PublicScalar::new(x).pow(message_length as u64))
-            .collect();
         let mut scalars: Vec<_> = self
             .terms
             .iter()
-            .map(|term| term.weight * term.form.mle_evaluate(&point[term.challenge_offset..]))
+            .map(|term| term.weight * term.folded_multiplier)
             .collect();
-        let mut accumulation = GeometricAccumulator::new(&points);
-        for prefix in coefficients.chunks_exact_mut(mask.coefficients_per_polynomial) {
-            accumulation.accumulate(prefix, &scalars);
-            for (scalar, stride) in scalars.iter_mut().zip(&strides) {
-                *scalar = stride.mul(*scalar);
-            }
-        }
+        geometric_accumulate_prefixes(
+            &mut coefficients,
+            &mut scalars,
+            &points,
+            mask.coefficients_per_polynomial,
+            message_length,
+        );
         coefficients
     }
 
@@ -269,6 +274,8 @@ impl<F: Field> Kernel<'_, F> {
             self.terms.push(KernelTerm {
                 form: UnivariateEvaluation::new(point, self.size),
                 weight,
+                folded_multiplier: F::ONE,
+                folded_through: self.challenges.len(),
                 challenge_offset: self.challenges.len(),
             });
         }
@@ -419,7 +426,7 @@ where
         .zip(&claim_weights)
         .map(|(&value, &weight)| value * weight)
         .sum();
-    let kernel = Kernel {
+    let mut kernel = Kernel {
         forms,
         claim_weights,
         challenges: Vec::new(),
@@ -684,38 +691,42 @@ mod tests {
             random_vector(&mut rng, 6),
         ] {
             for scale in [F::ZERO, F::ONE, F::from(11)] {
-                let mut kernel = Kernel {
-                    forms: &forms,
-                    claim_weights: (1..=forms.len()).map(|i| F::from(i as u64)).collect(),
-                    challenges: Vec::new(),
-                    initial_scale: F::from(3),
-                    size: 64,
-                    terms: Vec::new(),
-                };
-                for challenge in challenges.iter().copied().map(Some).chain([None]) {
-                    // Check both an empty query set and terms inserted after
-                    // different numbers of folds, including zero query weights.
-                    assert_mask_prefixes(&kernel);
-                    for (index, &point) in points.iter().enumerate() {
-                        kernel.terms.push(KernelTerm {
-                            form: UnivariateEvaluation::new(point, kernel.size),
-                            weight: if index == 4 { F::ZERO } else { F::from(7) },
-                            challenge_offset: kernel.challenges.len(),
-                        });
-                    }
-                    assert_mask_prefixes(&kernel);
-                    if let Some(challenge) = challenge {
-                        kernel.fold(&SumcheckOpening {
-                            round_challenges: vec![challenge],
-                            mask_rlc: scale,
-                        });
+                for fold_size in [1, 2, 3, 6] {
+                    let mut kernel = Kernel {
+                        forms: &forms,
+                        claim_weights: (1..=forms.len()).map(|i| F::from(i as u64)).collect(),
+                        challenges: Vec::new(),
+                        initial_scale: F::from(3),
+                        size: 64,
+                        terms: Vec::new(),
+                    };
+                    for batch in challenges.chunks(fold_size).map(Some).chain([None]) {
+                        // Check both an empty query set and terms inserted after
+                        // different numbers of folds, including zero query weights.
+                        assert_mask_prefixes(&mut kernel);
+                        for (index, &point) in points.iter().enumerate() {
+                            kernel.terms.push(KernelTerm {
+                                form: UnivariateEvaluation::new(point, kernel.size),
+                                weight: if index == 4 { F::ZERO } else { F::from(7) },
+                                folded_multiplier: F::ONE,
+                                folded_through: kernel.challenges.len(),
+                                challenge_offset: kernel.challenges.len(),
+                            });
+                        }
+                        assert_mask_prefixes(&mut kernel);
+                        if let Some(batch) = batch {
+                            kernel.fold(&SumcheckOpening {
+                                round_challenges: batch.to_vec(),
+                                mask_rlc: scale,
+                            });
+                        }
                     }
                 }
             }
         }
     }
 
-    fn assert_mask_prefixes<F: Field>(kernel: &Kernel<F>) {
+    fn assert_mask_prefixes<F: Field>(kernel: &mut Kernel<F>) {
         for log_polynomials in 0..=kernel.size.trailing_zeros() {
             let num_polynomials = 1 << log_polynomials;
             let message_length = kernel.size / num_polynomials;
@@ -724,10 +735,11 @@ mod tests {
                     num_polynomials,
                     coefficients_per_polynomial: prefix,
                 };
+                let reference = &*kernel;
                 let expected: Vec<_> = (0..num_polynomials)
                     .flat_map(|polynomial| {
                         (0..prefix)
-                            .map(move |i| kernel.coefficient(polynomial * message_length + i))
+                            .map(move |i| reference.coefficient(polynomial * message_length + i))
                     })
                     .collect();
                 assert_eq!(kernel.mask_coefficients(mask), expected);

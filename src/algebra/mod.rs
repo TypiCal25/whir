@@ -197,6 +197,34 @@ pub fn geometric_accumulate<F: Field>(accumulator: &mut [F], mut scalars: Vec<F>
     GeometricAccumulator::new(points).accumulate(accumulator, &scalars);
 }
 
+/// Accumulate geometric sequences over packed polynomial prefixes.
+///
+/// Prefix `p`, coefficient `i` receives `sum_j scalars[j] * points[j]^(p * message_length + i)`.
+/// Advances each scalar by `points[j]^message_length` after every prefix.
+pub(crate) fn geometric_accumulate_prefixes<F: Field>(
+    accumulator: &mut [F],
+    scalars: &mut [F],
+    points: &[F],
+    prefix_length: usize,
+    message_length: usize,
+) {
+    assert!(prefix_length > 0 && prefix_length <= message_length);
+    assert_eq!(accumulator.len() % prefix_length, 0);
+    assert_eq!(scalars.len(), points.len());
+    let strides: Vec<_> = points
+        .iter()
+        .map(|&point| PublicScalar::new(point).pow(message_length as u64))
+        .collect();
+    let mut accumulation = GeometricAccumulator::new(points);
+    // Multiplication advances between prefixes without division, including at zero points.
+    for prefix in accumulator.chunks_exact_mut(prefix_length) {
+        accumulation.accumulate(prefix, scalars);
+        for (scalar, stride) in scalars.iter_mut().zip(&strides) {
+            *scalar = stride.mul(*scalar);
+        }
+    }
+}
+
 /// Reuse point classification and scalar scratch across geometric accumulations.
 pub(crate) struct GeometricAccumulator<F: Field> {
     base_points: Vec<F::BasePrimeField>,

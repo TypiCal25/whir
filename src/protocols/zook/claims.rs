@@ -8,6 +8,7 @@ use zeroize::Zeroizing;
 use crate::{
     algebra::{
         embedding::{Identity, PublicScalar},
+        geometric_accumulate_prefixes,
         linear_form::{Covector, Evaluate},
     },
     protocols::{
@@ -111,7 +112,7 @@ impl<F: Field> MaskClaims<F> {
         mask: WitnessMaskConfig,
         message_length: usize,
         update: &CovectorUpdateParams<F>,
-        mut kernel_at: impl FnMut(usize) -> F,
+        kernel_at: impl FnMut(usize) -> F,
     ) {
         assert_eq!(update.ood_rlc_coeffs.len(), update.ood_eval_points.len());
         if !update.original_sl_coeff.is_one() {
@@ -120,15 +121,14 @@ impl<F: Field> MaskClaims<F> {
                 *weight = scale.mul(*weight);
             }
         }
-        self.subtract_witness_mask(range, mask, message_length, |index| {
-            let deep: F = update
-                .ood_rlc_coeffs
-                .iter()
-                .zip(&update.ood_eval_points)
-                .map(|(&weight, point)| weight * point.pow([index as u64]))
-                .sum();
-            kernel_at(index) - deep
-        });
+        self.subtract_witness_mask(range.clone(), mask, message_length, kernel_at);
+        geometric_accumulate_prefixes(
+            &mut self.covector.vector[range],
+            &mut update.ood_rlc_coeffs.clone(),
+            &update.ood_eval_points,
+            mask.coefficients_per_polynomial,
+            message_length,
+        );
     }
 }
 
@@ -169,7 +169,7 @@ mod tests {
         algebra::{
             dot,
             embedding::{Basefield, Embedding},
-            fields::{Field64, Field64_2},
+            fields::{Field64, Field64_2, Field64_3},
             random_vector, univariate_evaluate,
         },
         buffer::{Buffer, BufferMath, BufferOps},
@@ -298,6 +298,91 @@ mod tests {
             claims.covector.vector,
             [0, 0, 0, 0, 4, 0, 0, 4, 4].map(Field64::from)
         );
+    }
+
+    fn target_mask_matches_direct_powers<F: Field>()
+    where
+        Standard: Distribution<F>,
+    {
+        let mut rng = StdRng::seed_from_u64(329);
+        let random_points = random_vector::<F>(&mut rng, 2);
+        for points in [
+            vec![],
+            vec![F::ZERO],
+            vec![F::ONE],
+            vec![random_points[0]],
+            vec![
+                F::ZERO,
+                F::ONE,
+                F::from(7),
+                random_points[0],
+                random_points[1],
+                random_points[0],
+            ],
+        ] {
+            for message_length in [1, 4, 17] {
+                for prefix_length in [1, message_length] {
+                    for num_polynomials in [1, 3, 16] {
+                        let mask = WitnessMaskConfig {
+                            num_polynomials,
+                            coefficients_per_polynomial: prefix_length,
+                        };
+                        let range = 3..3 + num_polynomials * prefix_length;
+                        let kernel = random_vector::<F>(&mut rng, num_polynomials * message_length);
+                        let initial = random_vector::<F>(&mut rng, range.end + 2);
+                        for scale in [F::ZERO, F::ONE, F::from(3)] {
+                            let update = CovectorUpdateParams {
+                                original_sl_coeff: scale,
+                                ood_rlc_coeffs: random_vector::<F>(&mut rng, points.len()),
+                                ood_eval_points: points.clone(),
+                                in_domain_rlc_coeffs: vec![],
+                                in_domain_eval_points: vec![],
+                            };
+                            let mut expected = MaskClaims {
+                                covector: Covector::new(initial.clone()),
+                            };
+                            for weight in &mut expected.covector.vector {
+                                *weight *= scale;
+                            }
+                            expected.subtract_witness_mask(
+                                range.clone(),
+                                mask,
+                                message_length,
+                                |index| {
+                                    kernel[index]
+                                        - update
+                                            .ood_rlc_coeffs
+                                            .iter()
+                                            .zip(&points)
+                                            .map(|(&weight, point)| {
+                                                weight * point.pow([index as u64])
+                                            })
+                                            .sum::<F>()
+                                },
+                            );
+                            let mut actual = MaskClaims {
+                                covector: Covector::new(initial.clone()),
+                            };
+                            actual.subtract_target_mask(
+                                range.clone(),
+                                mask,
+                                message_length,
+                                &update,
+                                |index| kernel[index],
+                            );
+                            assert_eq!(actual, expected);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn target_mask_geometric_prefixes_match_direct_powers() {
+        target_mask_matches_direct_powers::<Field64>();
+        target_mask_matches_direct_powers::<Field64_2>();
+        target_mask_matches_direct_powers::<Field64_3>();
     }
 
     #[test]
