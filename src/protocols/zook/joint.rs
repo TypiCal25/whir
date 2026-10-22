@@ -51,7 +51,7 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
     }
 
     /// Prove forms over `[left | right]`. The result point starts with the selector.
-    /// Invalid parameters, claims, or handles fail before the transcript changes.
+    /// Invalid configurations or claim/handle dimensions fail before the transcript changes.
     pub fn prove_pair<H, R>(
         &self,
         ps: &mut ProverState<H, R>,
