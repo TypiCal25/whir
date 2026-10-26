@@ -136,7 +136,7 @@ mod tests {
         let config = ProtocolConfig::<M>::derive(spec(), tuning(4096)).unwrap();
         assert!(config.has_rounds());
         let joint = config.joint_masks().unwrap();
-        assert_eq!(joint.commit().num_vectors(), 1);
+        assert_eq!(joint.commit().num_vectors(), 2);
         assert_eq!(joint.commit().interleaving_depth(), 1);
         assert_eq!(joint.commit().mask_length(), 0);
         assert_eq!(joint.sumcheck_masks().len(), config.num_rounds());

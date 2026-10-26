@@ -107,7 +107,6 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         };
         let commit = self.basecase().commit();
         let witness_blind_commit = commit.receive_commitment(vs)?;
-        let mask_blind_commit = layout.commit().receive_commitment(vs)?;
         let blind_sum: M::Target = vs.prover_message()?;
         let blind_binding: Vec<M::Target> = vs.prover_messages_vec(3)?;
         let lambda = vs.verifier_message::<M::Target>();
@@ -116,16 +115,16 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         verify_combination(
             commit,
             vs,
-            [&witness_blind_commit, &state.irs],
+            &[&witness_blind_commit, &state.irs],
             &message,
-            lambda,
+            &[M::Target::ONE, lambda],
         )?;
         verify_combination(
             layout.commit(),
             vs,
-            [&mask_blind_commit, &masks.joint],
+            &[&masks.joint],
             &mask_message,
-            lambda,
+            &[lambda, M::Target::ONE],
         )?;
         for ((form, &value), blind) in masks
             .binding
@@ -141,13 +140,13 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
     }
 }
 
-/// Authenticate a single polynomial's revealed combination against both roots.
+/// Authenticate a revealed linear combination against the committed columns.
 fn verify_combination<F, H>(
     config: &IrsConfig<Identity<F>>,
     vs: &mut VerifierState<H>,
-    commitments: [&IrsCommitment; 2],
+    commitments: &[&IrsCommitment],
     message: &[F],
-    lambda: F,
+    weights: &[F],
 ) -> VerificationResult<()>
 where
     F: Field + Codec<[H::U]>,
@@ -155,12 +154,12 @@ where
     u8: Decoding<[H::U]>,
     Hash: ProverMessage<[H::U]>,
 {
-    assert_eq!(config.num_messages(), 1);
+    assert_eq!(config.interleaving_depth(), 1);
+    assert_eq!(config.num_messages() * commitments.len(), weights.len());
     assert_eq!(config.mask_length(), 0);
-    let evaluations = config.verify(vs, &commitments)?;
-    let weights = [F::ONE, lambda];
+    let evaluations = config.verify(vs, commitments)?;
     let values = evaluate_points(message, &evaluations.points);
-    for (actual, expected) in zip_strict(values, evaluations.values(&weights)) {
+    for (actual, expected) in zip_strict(values, evaluations.values(weights)) {
         verify!(actual == expected);
     }
     Ok(())
@@ -193,8 +192,9 @@ mod tests {
             random_vector,
         },
         buffer::{Buffer, BufferMath, BufferOps},
-        protocols::params::{
-            FoldingFactor, Mode, PowBudget, RateSchedule, SecuritySpec, TuningSpec,
+        protocols::{
+            params::{FoldingFactor, Mode, PowBudget, RateSchedule, SecuritySpec, TuningSpec},
+            zook::commit::CommittedWitness,
         },
         transcript::{codecs::Empty, DomainSeparator, ProverState},
     };
@@ -224,6 +224,14 @@ mod tests {
     }
 
     fn check_final_opening(mutate: impl Fn(&mut VerifierRoundState<'_, Field64_2>), accept: bool) {
+        check_final_opening_with_witness(|_| {}, mutate, accept);
+    }
+
+    fn check_final_opening_with_witness(
+        mutate_witness: impl Fn(&mut CommittedWitness<Basefield<Field64_2>>),
+        mutate: impl Fn(&mut VerifierRoundState<'_, Field64_2>),
+        accept: bool,
+    ) {
         for size in [8_usize, 4096] {
             let config = ProtocolConfig::<Basefield<Field64_2>>::derive(
                 SecuritySpec::new(80)
@@ -251,7 +259,8 @@ mod tests {
                 .session(&"final-opening")
                 .instance(&Empty);
             let mut ps = ProverState::new_std(&ds);
-            let committed = config.commit(&mut ps, witness);
+            let mut committed = config.commit(&mut ps, witness);
+            mutate_witness(&mut committed);
             let prover_claim = config.prove(&mut ps, committed, &forms, &values);
             let proof = ps.proof();
             let result = catch_unwind(AssertUnwindSafe(|| {
@@ -273,6 +282,21 @@ mod tests {
     #[test]
     fn final_opening_preserves_points_for_padded_and_short_forms() {
         check_final_opening(|_| {}, true);
+    }
+
+    #[test]
+    fn final_opening_rejects_changed_precommitted_blinder() {
+        check_final_opening_with_witness(
+            |committed| {
+                let joint = committed.joint_masks.as_mut().unwrap();
+                let mut changed = joint.opening_blinder.to_slice().to_vec();
+                changed[0] += Field64_2::ONE;
+                joint.opening_blinder.wipe();
+                joint.opening_blinder = Buffer::from(changed);
+            },
+            |_| {},
+            false,
+        );
     }
 
     #[test]

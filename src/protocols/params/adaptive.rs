@@ -40,7 +40,7 @@ const ADAPTIVE_MAX_LOG_INV_RATE: u32 = 20;
 struct RoundDims {
     codeword_length: usize,
     in_domain_samples: usize,
-    interleaving_depth: usize,
+    num_messages: usize,
     mask_coefficients: usize,
 }
 
@@ -68,7 +68,7 @@ const ENCODE_FIXED_OVERHEAD: f64 = 4096.0;
 /// rescaling of either axis, and the log-knee picker compounds that.
 fn round_cost_from_dims(dims: RoundDims, field_bytes: f64, hash_bytes: f64) -> (f64, f64) {
     let codeword = dims.codeword_length as f64;
-    let interleaving = dims.interleaving_depth as f64;
+    let interleaving = dims.num_messages as f64;
     let queries = dims.in_domain_samples as f64;
     let log_codeword = codeword.log2().max(1.0);
 
@@ -253,7 +253,7 @@ impl<'a, M: Embedding + Default> Planner<'a, M> {
                         self.hash_bytes,
                     );
                     let message_bytes = masks.vector_size() as f64 * self.field_bytes;
-                    cost = cost.add((2.0 * encode, 2.0 * proof + message_bytes));
+                    cost = cost.add((encode, proof + message_bytes));
                 }
                 out.push((chosen.clone(), cost));
             }
@@ -391,7 +391,32 @@ const fn dimensions<M: Embedding>(code: &IrsConfig<M>, mask_coefficients: usize)
     RoundDims {
         codeword_length: code.codeword_length(),
         in_domain_samples: code.in_domain_samples(),
-        interleaving_depth: code.interleaving_depth(),
+        num_messages: code.num_messages(),
         mask_coefficients,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        algebra::fields::Field64_2,
+        protocols::params::test_utils::{assert_close, johnson_code_with_vectors},
+    };
+
+    #[test]
+    fn shared_mask_tree_counts_both_columns_and_one_query_path() {
+        let single = johnson_code_with_vectors::<Identity<Field64_2>>(128, 1, 0.25, 1);
+        let shared = johnson_code_with_vectors::<Identity<Field64_2>>(128, 1, 0.25, 2);
+        let (single_encode, single_proof) =
+            round_cost_from_dims(dimensions(&single, 0), 16.0, 32.0);
+        let (shared_encode, shared_proof) =
+            round_cost_from_dims(dimensions(&shared, 0), 16.0, 32.0);
+        assert_close(shared_encode, 2.0 * single_encode - ENCODE_FIXED_OVERHEAD);
+        assert_close(
+            shared_proof,
+            single_proof + shared.in_domain_samples() as f64 * 16.0,
+        );
+        assert!(shared_proof < 2.0 * single_proof);
     }
 }

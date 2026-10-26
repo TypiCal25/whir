@@ -29,11 +29,20 @@ pub fn johnson_code<M: Embedding + Default>(
     depth: usize,
     rate: f64,
 ) -> IrsConfig<M> {
+    johnson_code_with_vectors(vector_size, depth, rate, 1)
+}
+
+pub fn johnson_code_with_vectors<M: Embedding + Default>(
+    vector_size: usize,
+    depth: usize,
+    rate: f64,
+    num_vectors: usize,
+) -> IrsConfig<M> {
     IrsConfig::new(IrsParams {
         security_target: 80.0,
         decoding_regime: DecodingRegime::Johnson,
         hash_id: BLAKE3,
-        num_vectors: 1,
+        num_vectors,
         vector_size,
         interleaving_depth: depth,
         rate,

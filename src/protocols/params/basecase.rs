@@ -12,7 +12,9 @@ use crate::{
         params::{
             bounds::{error_bits, log2_sum},
             error::{grind_to_at, DeriveError, Pow, ZookSecurityError},
-            irs_commit::{solve as solve_irs, validate_single_polynomial},
+            irs_commit::{
+                solve as solve_irs, validate_joint_mask_code, validate_single_polynomial,
+            },
             protocol_config::{BasecasePlan, WitnessMaskConfig},
             regime::constrained_agreement_bits,
             solved::Solved,
@@ -86,6 +88,8 @@ pub fn solve_with_commit<F: Field>(
 /// `epsilon_queries <= (1 - theta_witness)^s_witness + (1 - theta_masks)^s_masks`.
 /// Each `A` bounds degree-one constrained correlated agreement for its code;
 /// each `theta` is that code's proximity radius and each `s` its query count.
+/// The mask commitment holds two full-length columns combined with weights
+/// `[lambda, 1]`; sharing their root leaves the degree-one combination unchanged.
 /// The implementation conservatively uses the degree-two agreement bound.
 /// Taking the maximum of error probabilities gives the minimum of security bits.
 ///
@@ -106,7 +110,7 @@ impl ZookFinalOpeningSoundness {
         masks: &IrsConfig<Identity<F>>,
     ) -> Result<Self, ZookSecurityError> {
         validate_single_polynomial(witness)?;
-        validate_single_polynomial(masks)?;
+        validate_joint_mask_code(masks)?;
         Ok(Self {
             combination: constrained_agreement_bits(witness)?
                 .min(constrained_agreement_bits(masks)?),
@@ -120,7 +124,10 @@ mod tests {
     use super::*;
     use crate::{
         algebra::fields::{Field64, Field64_2, FieldWithSize},
-        protocols::params::{spec::PowBudget, test_utils::johnson_code},
+        protocols::params::{
+            spec::PowBudget,
+            test_utils::{johnson_code, johnson_code_with_vectors},
+        },
     };
 
     #[test]
@@ -157,14 +164,15 @@ mod tests {
     #[test]
     fn final_queries_lose_one_bit_when_errors_are_equal() {
         let code = johnson_code::<Identity<Field64_2>>(128, 1, 0.25);
-        let result = ZookFinalOpeningSoundness::for_codes(&code, &code).unwrap();
+        let masks = johnson_code_with_vectors::<Identity<Field64_2>>(128, 1, 0.25, 2);
+        let result = ZookFinalOpeningSoundness::for_codes(&code, &masks).unwrap();
         assert!((f64::from(result.queries) - (code.rbr_queries() - 1.0)).abs() < 1e-10);
     }
 
     #[test]
     fn final_opening_uses_weaker_agreement_bound() {
         let witness = johnson_code::<Identity<Field64_2>>(64, 1, 0.25);
-        let masks = johnson_code::<Identity<Field64_2>>(1024, 1, 0.25);
+        let masks = johnson_code_with_vectors::<Identity<Field64_2>>(1024, 1, 0.25, 2);
         let result = ZookFinalOpeningSoundness::for_codes(&witness, &masks).unwrap();
         assert_eq!(
             result.combination,

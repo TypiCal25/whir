@@ -883,9 +883,17 @@ mod tests {
                     state.message.dot(&state.covector) + checked.claims.evaluate(coefficients)
                 );
                 let evaluations = layout.commit().verify(vs, &[&checked.joint]).unwrap();
-                for (&point, &value) in evaluations.points.iter().zip(evaluations.matrix.to_slice())
+                assert_eq!(evaluations.matrix.len(), 2 * evaluations.points.len());
+                for (&point, row) in evaluations
+                    .points
+                    .iter()
+                    .zip(evaluations.matrix.to_slice().chunks_exact(2))
                 {
-                    assert_eq!(value, univariate_evaluate(coefficients, point));
+                    assert_eq!(row[0], univariate_evaluate(coefficients, point));
+                    assert_eq!(
+                        row[1],
+                        univariate_evaluate(masks.joint.opening_blinder.to_slice(), point)
+                    );
                 }
             }
             (None, None, None) => assert_eq!(state.sum, state.message.dot(&state.covector)),

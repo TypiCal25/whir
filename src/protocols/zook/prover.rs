@@ -1,5 +1,7 @@
 //! Zook prover: joint-mask round reduction followed by final opening.
 
+use std::mem::take;
+
 use ark_ff::Zero;
 use ark_std::rand::{distributions::Standard, prelude::Distribution, CryptoRng, RngCore};
 #[cfg(feature = "tracing")]
@@ -122,14 +124,13 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         u8: Decoding<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
-        let (Some(layout), Some(masks)) = (self.joint_masks(), state.masks.as_ref()) else {
+        let (Some(layout), Some(masks)) = (self.joint_masks(), state.masks.as_mut()) else {
             panic!("final opening requires the joint mask commitment");
         };
         let commit = self.basecase().commit();
         let mut witness_blinder = Buffer::random(ps.rng(), commit.vector_size());
-        let mut mask_blinder = Buffer::random(ps.rng(), layout.commit().vector_size());
+        let mut mask_blinder = take(&mut masks.joint.opening_blinder);
         let mut witness_blind_commit = commit.commit(ps, &[&witness_blinder]);
-        let mut mask_blind_commit = layout.commit().commit(ps, &[&mask_blinder]);
         let blind_sum =
             witness_blinder.dot(&state.covector) + masks.claims.evaluate(mask_blinder.to_slice());
         ps.prover_message(&blind_sum);
@@ -148,11 +149,8 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         ps.prover_messages(witness_blinder.to_slice());
         ps.prover_messages(mask_blinder.to_slice());
         let _ = commit.open(ps, &[&witness_blind_commit, &state.irs_witness]);
-        let _ = layout
-            .commit()
-            .open(ps, &[&mask_blind_commit, &masks.joint.irs_witness]);
+        let _ = layout.commit().open(ps, &[&masks.joint.irs_witness]);
         witness_blind_commit.matrix.wipe();
-        mask_blind_commit.matrix.wipe();
         state.sum = blind_sum + lambda * state.sum - masks.claims.evaluate(mask_blinder.to_slice());
         state.message.wipe();
         state.message = witness_blinder;

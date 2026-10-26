@@ -31,16 +31,18 @@ pub struct CommittedWitness<M: Embedding> {
     pub(super) mask_binding: Option<MaskBinding<M::Target>>,
 }
 
-/// Secret coefficients and their single IRS commitment, retained for mask openings.
+/// Joint masks and their final-opening blinder, committed as two columns in one tree.
 #[derive(Clone, Debug)]
 pub(crate) struct JointMaskWitness<F: Field> {
     pub(crate) coefficients: Buffer<F>,
+    pub(crate) opening_blinder: Buffer<F>,
     pub(crate) irs_witness: IrsWitness<F>,
 }
 
 impl<F: Field> Drop for JointMaskWitness<F> {
     fn drop(&mut self) {
         self.coefficients.wipe();
+        self.opening_blinder.wipe();
         self.irs_witness.masks.wipe();
         self.irs_witness.matrix.wipe();
     }
@@ -103,9 +105,13 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
             let (coefficients, source_mask) =
                 sample_masks::<M, _>(config, self.has_rounds(), ps.rng());
             initial_mask = source_mask;
-            let irs_witness = config.commit().commit(ps, &[&coefficients]);
+            let opening_blinder = Buffer::random(ps.rng(), config.commit().vector_size());
+            let irs_witness = config
+                .commit()
+                .commit(ps, &[&coefficients, &opening_blinder]);
             JointMaskWitness {
                 coefficients,
+                opening_blinder,
                 irs_witness,
             }
         });
@@ -369,11 +375,22 @@ mod tests {
                 .commit()
                 .verify(&mut vs, &[received.joint_masks.as_ref().unwrap()])
                 .unwrap();
-            assert_openings(
-                &values,
-                &committed.joint_masks.as_ref().unwrap().coefficients,
-                1,
-            );
+            let joint = committed.joint_masks.as_ref().unwrap();
+            assert_eq!(values.matrix.len(), 2 * values.points.len());
+            for (&point, row) in values
+                .points
+                .iter()
+                .zip(values.matrix.to_slice().chunks_exact(2))
+            {
+                assert_eq!(
+                    row[0],
+                    univariate_evaluate(joint.coefficients.to_slice(), point)
+                );
+                assert_eq!(
+                    row[1],
+                    univariate_evaluate(joint.opening_blinder.to_slice(), point)
+                );
+            }
         }
         match &committed.state {
             CommittedState::Round { message, .. } => {

@@ -29,9 +29,12 @@ pub enum ZookSecurityError {
     /// The correlated-agreement bound requires half-distance ≤ theta < Johnson radius.
     #[error("proximity parameter is outside the correlated-agreement interval")]
     InvalidProximity,
-    /// The joint mask and final witness commitments each encode one polynomial.
+    /// The final witness commitment encodes one polynomial.
     #[error("expected a single non-interleaved polynomial")]
     ExpectedSinglePolynomial,
+    /// Joint masks and their final-opening blinder occupy two full-length columns.
+    #[error("expected joint masks and their final-opening blinder as two non-interleaved vectors")]
+    ExpectedMaskAndBlinder,
     /// One round commits the polynomial obtained by folding its source columns.
     #[error("target vector size must equal source polynomial length")]
     InvalidRoundShape,

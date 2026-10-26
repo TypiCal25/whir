@@ -13,7 +13,7 @@ use crate::{
             basecase::ZookFinalOpeningSoundness,
             bounds::{error_bits, out_of_domain_bits, rate, usize_to_f64},
             error::{grind_to_at, DeriveError, Pow, ZookSecurityError},
-            irs_commit::{solve as solve_irs, validate_single_polynomial},
+            irs_commit::{solve_with_num_vectors, validate_joint_mask_code},
             protocol_config::JointMaskConfig,
             solved::Solved,
             spec::{RoundContext, SecuritySpec},
@@ -25,7 +25,7 @@ use crate::{
 // The resulting code must still satisfy the binding and final-opening bounds.
 const MASK_LOG_INV_RATE: u32 = 4;
 
-/// One codeword contains sparse sumcheck masks, witness masks, and two blinders.
+/// The joint-mask column contains sparse sumcheck masks, witness masks, and two blinders.
 ///
 /// ProveKit Prover Whitepaper §5.4, “ZO0K”, “The required masks”.
 /// Sizes are summed from the components: each folding mask has `2 * folds + 1`
@@ -93,13 +93,14 @@ pub(super) fn solve_commit<F: Field>(
         .and_then(|n| n.checked_add(1))
         .and_then(|n| n.checked_add(extension_degree))
         .ok_or(DeriveError::SizeOverflow)?;
-    solve_irs(
+    solve_with_num_vectors(
         spec,
         &RoundContext {
             vector_size,
             log_inv_rate: MASK_LOG_INV_RATE,
             folding_factor: 0,
         },
+        2,
     )
 }
 
@@ -114,6 +115,7 @@ fn next_range(end: &mut usize, length: usize) -> Result<Range<usize>, DeriveErro
 /// `epsilon <= L*(L-1)*m/(2*(Q-1)) + L*m/(Q-1) = L*(L+1)*m/(2*(Q-1))`.
 /// Here `L = masks.list_size()`, `m = masks.message_length()`, and `Q = |F|`.
 /// The first term bounds DEEP collisions; the second bounds the Frobenius check.
+/// Both concern only the joint-mask column; the other column is its final-opening blinder.
 /// Unlike §6.3, “The zk-IOPP”, Phase 0, sampling excludes zero, where the
 /// shifted membership blinder vanishes. Nonzero evaluation-domain points remain
 /// allowed, so the root-count bounds use the challenge-domain size `Q-1`.
@@ -123,7 +125,7 @@ fn next_range(end: &mut usize, length: usize) -> Result<Range<usize>, DeriveErro
 pub fn zook_mask_binding_bits<F: Field>(
     masks: &IrsConfig<Identity<F>>,
 ) -> Result<Bits, ZookSecurityError> {
-    validate_single_polynomial(masks)?;
+    validate_joint_mask_code(masks)?;
     let list = masks.list_size();
     Ok(error_bits(
         list.log2() + (list + 1.0).log2() - 1.0 + usize_to_f64(masks.message_length()).log2()
@@ -138,7 +140,7 @@ mod tests {
         algebra::fields::{Field64_2, Field64_3},
         protocols::params::{
             spec::{Mode, PowBudget},
-            test_utils::{assert_probability_bits, johnson_code},
+            test_utils::{assert_probability_bits, johnson_code_with_vectors},
         },
     };
 
@@ -151,13 +153,13 @@ mod tests {
         assert_eq!(commit.vector_size(), 4566);
         assert!(commit.codeword_length() >= 16 * commit.vector_size());
         assert!(4495 + commit.in_domain_samples() + 1 + 3 <= commit.vector_size());
-        validate_single_polynomial(&commit).unwrap();
+        validate_joint_mask_code(&commit).unwrap();
         assert!(zook_mask_binding_bits(&commit).unwrap() >= Bits::from(128.0));
     }
 
     #[test]
     fn mask_binding_includes_frobenius_error() {
-        let masks = johnson_code::<Identity<Field64_2>>(256, 1, 0.25);
+        let masks = johnson_code_with_vectors::<Identity<Field64_2>>(256, 1, 0.25, 2);
         let challenges = 2.0_f64.powf(Field64_2::field_size_bits()) - 1.0;
         let list = masks.list_size();
         let degree = masks.message_length() as f64;

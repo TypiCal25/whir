@@ -18,6 +18,15 @@ pub fn solve<M: Embedding + Default>(
     spec: &SecuritySpec,
     ctx: &RoundContext,
 ) -> Result<IrsConfig<M>, DeriveError> {
+    solve_with_num_vectors(spec, ctx, 1)
+}
+
+/// Encode equal-length vectors in one commitment with shared query paths.
+pub(super) fn solve_with_num_vectors<M: Embedding + Default>(
+    spec: &SecuritySpec,
+    ctx: &RoundContext,
+    num_vectors: usize,
+) -> Result<IrsConfig<M>, DeriveError> {
     let depth = 1_usize
         .checked_shl(ctx.folding_factor)
         .ok_or(DeriveError::SizeOverflow)?;
@@ -38,7 +47,7 @@ pub fn solve<M: Embedding + Default>(
         security_target,
         decoding_regime: spec.decoding_regime,
         hash_id: spec.hash_id,
-        num_vectors: 1,
+        num_vectors,
         vector_size: ctx.vector_size,
         interleaving_depth: depth,
         rate,
@@ -73,13 +82,24 @@ pub(super) fn validate_zook_code<M: Embedding>(
     Ok(())
 }
 
-/// Restrict the final witness and joint-mask bounds to one polynomial per commitment.
+/// Restrict the final witness bound to one polynomial per commitment.
 pub(super) fn validate_single_polynomial<M: Embedding>(
     code: &IrsConfig<M>,
 ) -> Result<(), ZookSecurityError> {
     validate_zook_code(code)?;
     if code.num_vectors() != 1 || code.interleaving_depth() != 1 {
         return Err(ZookSecurityError::ExpectedSinglePolynomial);
+    }
+    Ok(())
+}
+
+/// Require two full-length columns: joint masks and their final-opening blinder.
+pub(super) fn validate_joint_mask_code<M: Embedding>(
+    code: &IrsConfig<M>,
+) -> Result<(), ZookSecurityError> {
+    validate_zook_code(code)?;
+    if code.num_vectors() != 2 || code.interleaving_depth() != 1 {
+        return Err(ZookSecurityError::ExpectedMaskAndBlinder);
     }
     Ok(())
 }
@@ -95,9 +115,31 @@ mod tests {
             fields::{Field64, Field64_2},
         },
         hash::BLAKE3,
-        protocols::params::{spec::DecodingRegime, test_utils::johnson_code},
+        protocols::params::{
+            spec::DecodingRegime,
+            test_utils::{johnson_code, johnson_code_with_vectors},
+        },
     };
     type F = Field64_2;
+
+    #[test]
+    fn joint_masks_require_two_full_length_columns() {
+        for vectors in [1, 2, 3] {
+            for depth in [1, 2] {
+                let code = johnson_code_with_vectors::<Identity<F>>(128, depth, 0.25, vectors);
+                let expected = if vectors == 2 && depth == 1 {
+                    Ok(())
+                } else {
+                    Err(ZookSecurityError::ExpectedMaskAndBlinder)
+                };
+                assert_eq!(validate_joint_mask_code(&code), expected);
+                assert_eq!(
+                    validate_single_polynomial(&code).is_ok(),
+                    vectors == 1 && depth == 1
+                );
+            }
+        }
+    }
 
     #[test]
     fn rejects_appended_masks_and_unsupported_regimes() {

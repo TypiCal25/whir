@@ -789,7 +789,7 @@ mod tests {
         let interleaved = johnson_code::<Identity<Field64_2>>(128, 2, 0.25);
         assert_eq!(
             zook_mask_binding_bits(&interleaved),
-            Err(ZookSecurityError::ExpectedSinglePolynomial)
+            Err(ZookSecurityError::ExpectedMaskAndBlinder)
         );
         let wrong_target = johnson_code::<Identity<Field64_2>>(32, 1, 0.25);
         assert_eq!(
