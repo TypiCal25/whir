@@ -247,11 +247,13 @@ impl<'a, M: Embedding + Default> Planner<'a, M> {
                     {
                         return;
                     }
-                    cost = cost.add(round_cost_from_dims(
+                    let (encode, proof) = round_cost_from_dims(
                         dimensions(&masks, 0),
                         self.field_bytes,
                         self.hash_bytes,
-                    ));
+                    );
+                    let message_bytes = masks.vector_size() as f64 * self.field_bytes;
+                    cost = cost.add((2.0 * encode, 2.0 * proof + message_bytes));
                 }
                 out.push((chosen.clone(), cost));
             }
