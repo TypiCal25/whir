@@ -1,11 +1,7 @@
 use ark_ff::Field;
 
 use super::LinearForm;
-use crate::algebra::{
-    embedding::{Embedding, PublicScalar},
-    linear_form::Evaluate,
-    mixed_univariate_evaluate,
-};
+use crate::algebra::{embedding::Embedding, linear_form::Evaluate, mixed_univariate_evaluate};
 
 /// Linear form to represent univariate polynomial evaluation.
 ///
@@ -39,13 +35,13 @@ impl<F: Field> LinearForm<F> for UnivariateEvaluation<F> {
         let (padding, point) = point.split_at(point.len() - dimensions);
         let truncated = !self.size.is_power_of_two();
         let mut bound = self.size;
-        let mut x2i = PublicScalar::new(self.point);
+        let mut x2i = self.point;
         let mut full = F::ONE;
         let mut prefix = F::ZERO;
         // Coordinates are most significant first; build from the least significant bit.
         for &r in point.iter().rev() {
             let zero = F::ONE - r;
-            let one = x2i.mul(r);
+            let one = r * x2i;
             if truncated {
                 // A set bound bit admits the full zero branch and a truncated one branch.
                 prefix = if bound & 1 == 0 {
@@ -56,7 +52,7 @@ impl<F: Field> LinearForm<F> for UnivariateEvaluation<F> {
                 bound >>= 1;
             }
             full *= zero + one;
-            x2i.square();
+            x2i.square_in_place();
         }
         let result = if truncated { prefix } else { full };
         padding
@@ -66,11 +62,10 @@ impl<F: Field> LinearForm<F> for UnivariateEvaluation<F> {
 
     fn accumulate(&self, accumulator: &mut [F], scalar: F) {
         assert_eq!(accumulator.len(), self.size);
-        let point = PublicScalar::new(self.point);
         let mut power = scalar;
         for entry in accumulator {
             *entry += power;
-            power = point.mul(power);
+            power *= self.point;
         }
     }
 }

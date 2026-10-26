@@ -8,7 +8,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     algebra::{
-        embedding::{Embedding, Identity, PublicScalar},
+        embedding::{Embedding, Identity},
         eq_weights, geometric_accumulate_prefixes, geometric_sequence,
         linear_form::{LinearForm, MultilinearExtension, UnivariateEvaluation},
         scalar_mul_add,
@@ -195,10 +195,10 @@ impl<F: Field> Kernel<'_, F> {
             }
             // For k new challenges r_j, a query point x gains the factor
             // product_j (1 - r_j + r_j * x^(self.size * 2^(k-1-j))).
-            let mut power = PublicScalar::new(term.form.point).pow(self.size as u64);
+            let mut power = term.form.point.pow([self.size as u64]);
             for &challenge in challenges.iter().rev() {
-                term.folded_multiplier *= F::ONE - challenge + power.mul(challenge);
-                power.square();
+                term.folded_multiplier *= F::ONE - challenge + power * challenge;
+                power.square_in_place();
             }
             term.folded_through = self.challenges.len();
         }

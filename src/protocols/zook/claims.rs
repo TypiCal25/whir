@@ -7,7 +7,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     algebra::{
-        embedding::{Identity, PublicScalar},
+        embedding::Identity,
         geometric_accumulate_prefixes,
         linear_form::{Covector, Evaluate},
     },
@@ -116,9 +116,8 @@ impl<F: Field> MaskClaims<F> {
     ) {
         assert_eq!(update.ood_rlc_coeffs.len(), update.ood_eval_points.len());
         if !update.original_sl_coeff.is_one() {
-            let scale = PublicScalar::new(update.original_sl_coeff);
             for weight in &mut self.covector.vector {
-                *weight = scale.mul(*weight);
+                *weight *= update.original_sl_coeff;
             }
         }
         self.subtract_witness_mask(range.clone(), mask, message_length, kernel_at);
