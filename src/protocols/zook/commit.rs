@@ -185,7 +185,7 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         };
         let mask_binding = self
             .joint_masks()
-            .map(|config| receive_binding(config, self.mask_source_degree(), vs))
+            .map(|_| receive_binding(self.mask_source_degree(), vs))
             .transpose()?;
         Ok(Commitment {
             irs,
@@ -292,7 +292,6 @@ mod tests {
         algebra::{
             embedding::{Basefield, Identity},
             fields::{Field64, Field64_2},
-            linear_form::Evaluate,
             univariate_evaluate,
         },
         protocols::{
@@ -362,9 +361,10 @@ mod tests {
                 .unwrap()
                 .coefficients
                 .to_slice();
-            for (form, &value) in binding.forms.iter().zip(&binding.values) {
-                assert_eq!(form.evaluate(&Identity::new(), coefficients), value);
-            }
+            assert_eq!(
+                binding.evaluate(config.joint_masks().unwrap(), coefficients),
+                binding.values,
+            );
         }
         assert_eq!(
             received.joint_masks.is_some(),

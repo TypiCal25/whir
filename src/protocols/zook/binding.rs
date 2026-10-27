@@ -5,8 +5,8 @@ use ark_std::rand::{CryptoRng, RngCore};
 
 use crate::{
     algebra::{
-        embedding::{Embedding, Frobenius, Identity},
-        linear_form::{Covector, Evaluate, UnivariateEvaluation},
+        embedding::{Embedding, Frobenius},
+        univariate_evaluate,
     },
     protocols::params::JointMaskConfig,
     transcript::{
@@ -23,8 +23,19 @@ use crate::{
 /// initial witness commitment's field. The final opening checks all three.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct MaskBinding<F: Field> {
-    pub(super) forms: [Covector<F>; 3],
+    points: [F; 2],
     pub(super) values: [F; 3],
+}
+
+impl<F: Field> MaskBinding<F> {
+    pub(super) fn evaluate(&self, config: &JointMaskConfig<F>, coefficients: &[F]) -> [F; 3] {
+        assert_eq!(coefficients.len(), config.commit().vector_size());
+        [
+            univariate_evaluate(coefficients, self.points[0]),
+            membership_evaluate(config, coefficients, self.points[0]),
+            membership_evaluate(config, coefficients, self.points[1]),
+        ]
+    }
 }
 
 /// Publish the two Phase 0 evaluations after both commitment roots.
@@ -40,14 +51,13 @@ where
     R: RngCore + CryptoRng,
 {
     let point = binding_challenge(ps);
-    let forms = binding_forms(config, point, source_degree);
-    let identity = Identity::new();
-    let evaluation = forms[0].evaluate(&identity, coefficients);
-    let membership = forms[1].evaluate(&identity, coefficients);
+    assert_eq!(coefficients.len(), config.commit().vector_size());
+    let evaluation = univariate_evaluate(coefficients, point);
+    let membership = membership_evaluate(config, coefficients, point);
     ps.prover_message(&evaluation);
     ps.prover_message(&membership);
     MaskBinding {
-        forms,
+        points: [point, Frobenius::new(source_degree).map(point)],
         values: [
             evaluation,
             membership,
@@ -58,7 +68,6 @@ where
 
 /// Receive claimed evaluations; their equations remain deferred to final opening.
 pub(super) fn receive_binding<F, H>(
-    config: &JointMaskConfig<F>,
     source_degree: u64,
     vs: &mut VerifierState<H>,
 ) -> VerificationResult<MaskBinding<F>>
@@ -70,7 +79,7 @@ where
     let evaluation = vs.prover_message()?;
     let membership = vs.prover_message()?;
     Ok(MaskBinding {
-        forms: binding_forms(config, point, source_degree),
+        points: [point, Frobenius::new(source_degree).map(point)],
         values: [
             evaluation,
             membership,
@@ -93,36 +102,12 @@ where
     }
 }
 
-fn binding_forms<F: Field>(
-    config: &JointMaskConfig<F>,
-    point: F,
-    source_degree: u64,
-) -> [Covector<F>; 3] {
-    [
-        Covector::from(&UnivariateEvaluation::new(
-            point,
-            config.commit().vector_size(),
-        )),
-        membership_form(config, point),
-        membership_form(config, Frobenius::new(source_degree).map(point)),
-    ]
-}
-
-/// `V_z(m) = initial_mask(z) + z^q * blinder(z)`, with `q` initial-mask coefficients.
-///
-/// The two ranges need not be adjacent in the joint commitment. Their weights
-/// use consecutive powers starting at one, independent of their stored offsets.
-fn membership_form<F: Field>(config: &JointMaskConfig<F>, point: F) -> Covector<F> {
-    let mut weights = vec![F::ZERO; config.commit().vector_size()];
-    let mut power = F::ONE;
-    for index in config.witness_masks()[0]
-        .clone()
-        .chain(config.basefield_blinder().clone())
-    {
-        weights[index] = power;
-        power *= point;
-    }
-    Covector::new(weights)
+/// Evaluate the logical concatenation of the initial mask and membership blinder.
+fn membership_evaluate<F: Field>(config: &JointMaskConfig<F>, coefficients: &[F], point: F) -> F {
+    let initial = &coefficients[config.witness_masks()[0].clone()];
+    let blinder = &coefficients[config.basefield_blinder().clone()];
+    univariate_evaluate(initial, point)
+        + point.pow([initial.len() as u64]) * univariate_evaluate(blinder, point)
 }
 
 #[cfg(test)]
@@ -132,15 +117,47 @@ mod tests {
     use super::*;
     use crate::{
         algebra::{
-            embedding::Basefield,
+            embedding::{Basefield, Identity},
             fields::{Field64, Field64_2},
-            univariate_evaluate,
+            linear_form::{Covector, Evaluate, UnivariateEvaluation},
         },
         protocols::params::{
             FoldingFactor, Mode, PowBudget, ProtocolConfig, RateSchedule, SecuritySpec, TuningSpec,
         },
         transcript::{codecs::Empty, DomainSeparator, MockSponge},
     };
+
+    fn binding_forms<F: Field>(
+        config: &JointMaskConfig<F>,
+        point: F,
+        source_degree: u64,
+    ) -> [Covector<F>; 3] {
+        [
+            Covector::from(&UnivariateEvaluation::new(
+                point,
+                config.commit().vector_size(),
+            )),
+            membership_form(config, point),
+            membership_form(config, Frobenius::new(source_degree).map(point)),
+        ]
+    }
+
+    /// `V_z(m) = initial_mask(z) + z^q * blinder(z)`, with `q` initial-mask coefficients.
+    ///
+    /// The two ranges need not be adjacent in the joint commitment. Their weights
+    /// use consecutive powers starting at one, independent of their stored offsets.
+    fn membership_form<F: Field>(config: &JointMaskConfig<F>, point: F) -> Covector<F> {
+        let mut weights = vec![F::ZERO; config.commit().vector_size()];
+        let mut power = F::ONE;
+        for index in config.witness_masks()[0]
+            .clone()
+            .chain(config.basefield_blinder().clone())
+        {
+            weights[index] = power;
+            power *= point;
+        }
+        Covector::new(weights)
+    }
 
     fn config() -> ProtocolConfig<Basefield<Field64_2>> {
         ProtocolConfig::derive(
@@ -179,12 +196,12 @@ mod tests {
             };
             let mut ps = ProverState::new(&ds, sponge.clone());
             let binding = prove_binding(layout, &coefficients, 1, &mut ps);
-            assert_eq!(binding.forms, binding_forms(layout, Field64_2::from(7), 1));
+            assert_eq!(binding.points, [Field64_2::from(7); 2]);
             assert_ne!(binding.values[1], Field64_2::ZERO);
             assert_eq!(ps.verifier_message::<u8>(), 42);
             let proof = ps.proof();
             let mut vs = VerifierState::new(&ds, &proof, sponge);
-            assert_eq!(receive_binding(layout, 1, &mut vs).unwrap(), binding);
+            assert_eq!(receive_binding(1, &mut vs).unwrap(), binding);
             assert_eq!(vs.verifier_message::<u8>(), 42);
             vs.check_eof().unwrap();
         }
@@ -202,11 +219,38 @@ mod tests {
             .map(|index| Field64_2::from(index as u64))
             .collect();
         for point in [Field64_2::ZERO, Field64_2::ONE, Field64_2::from(7)] {
-            let expected = univariate_evaluate(&coefficients[initial.clone()], point)
-                + point.pow([initial.len() as u64])
-                    * univariate_evaluate(&coefficients[blinder.clone()], point);
             let form = membership_form(layout, point);
-            assert_eq!(form.evaluate(&Identity::new(), &coefficients), expected);
+            assert_eq!(
+                membership_evaluate(layout, &coefficients, point),
+                form.evaluate(&Identity::new(), &coefficients),
+            );
+        }
+    }
+
+    #[test]
+    fn compact_binding_matches_dense_forms() {
+        let config = config();
+        let layout = config.joint_masks().unwrap();
+        let coefficients: Vec<_> = (0..layout.commit().vector_size())
+            .map(|i| Field64_2::new(Field64::from(i as u64), Field64::from((i + 3) as u64)))
+            .collect();
+        for point in [
+            Field64_2::ZERO,
+            Field64_2::ONE,
+            Field64_2::new(Field64::from(7), Field64::ONE),
+        ] {
+            for source_degree in [1, Field64_2::extension_degree()] {
+                let binding = MaskBinding {
+                    points: [
+                        point,
+                        point.frobenius_map(usize::try_from(source_degree).unwrap()),
+                    ],
+                    values: [Field64_2::ZERO; 3],
+                };
+                let expected = binding_forms(layout, point, source_degree)
+                    .map(|form| form.evaluate(&Identity::new(), &coefficients));
+                assert_eq!(binding.evaluate(layout, &coefficients), expected);
+            }
         }
     }
 
@@ -217,26 +261,26 @@ mod tests {
         let point = Field64_2::new(Field64::ONE, Field64::ONE);
         let mut coefficients = vec![Field64_2::ZERO; layout.commit().vector_size()];
         coefficients[layout.witness_masks()[0].start + 1] = Field64_2::ONE;
-        let forms = binding_forms(layout, point, 1);
-        let value = forms[1].evaluate(&Identity::new(), &coefficients);
-        let conjugate = forms[2].evaluate(&Identity::new(), &coefficients);
+        let mut binding = MaskBinding {
+            points: [point, point.frobenius_map(1)],
+            values: [Field64_2::ZERO; 3],
+        };
+        let [_, value, conjugate] = binding.evaluate(layout, &coefficients);
         assert_ne!(value, conjugate);
         assert_eq!(conjugate, value.frobenius_map(1));
 
         // A non-source-field constant leaves the first evaluation well-defined
         // but violates the Frobenius equation for the same committed vector.
         coefficients[layout.witness_masks()[0].start] = point;
-        let value = forms[1].evaluate(&Identity::new(), &coefficients);
-        assert_ne!(
-            forms[2].evaluate(&Identity::new(), &coefficients),
-            value.frobenius_map(1)
-        );
+        let [_, value, conjugate] = binding.evaluate(layout, &coefficients);
+        assert_ne!(conjugate, value.frobenius_map(1));
 
         // When the source is the whole quadratic field, its Frobenius fixes
         // every coefficient, including the non-prime-field constant above.
-        let forms = binding_forms(layout, point, Field64_2::extension_degree());
-        let value = forms[1].evaluate(&Identity::new(), &coefficients);
-        assert_eq!(forms[2].evaluate(&Identity::new(), &coefficients), value);
+        binding.points[1] =
+            point.frobenius_map(usize::try_from(Field64_2::extension_degree()).unwrap());
+        let [_, value, conjugate] = binding.evaluate(layout, &coefficients);
+        assert_eq!(conjugate, value);
         assert_eq!(
             Frobenius::new(Field64_2::extension_degree()).map(value),
             value
@@ -264,13 +308,11 @@ mod tests {
             }
             let proof = ps.proof();
             let mut vs = VerifierState::new_std(&ds, &proof);
-            let binding = receive_binding(layout, 1, &mut vs).unwrap();
+            let binding = receive_binding(1, &mut vs).unwrap();
             vs.check_eof().unwrap();
-            for (index, form) in binding.forms[..2].iter().enumerate() {
-                assert_eq!(
-                    form.evaluate(&Identity::new(), &coefficients) == binding.values[index],
-                    index != changed,
-                );
+            let actual = binding.evaluate(layout, &coefficients);
+            for (index, &value) in actual.iter().take(2).enumerate() {
+                assert_eq!(value == binding.values[index], index != changed);
             }
         }
     }
@@ -288,6 +330,6 @@ mod tests {
         let mut proof = ps.proof();
         proof.narg_string.pop();
         let mut vs = VerifierState::new_std(&ds, &proof);
-        assert!(receive_binding(layout, 1, &mut vs).is_err());
+        assert!(receive_binding::<Field64_2, _>(1, &mut vs).is_err());
     }
 }

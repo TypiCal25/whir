@@ -10,7 +10,7 @@ use tracing::instrument;
 use crate::{
     algebra::{
         embedding::{Embedding, Identity},
-        linear_form::{Evaluate, LinearForm},
+        linear_form::LinearForm,
         multilinear_extend, univariate_evaluate,
     },
     hash::Hash,
@@ -126,14 +126,14 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
             &mask_message,
             &[lambda, M::Target::ONE],
         )?;
-        for ((form, &value), blind) in masks
+        for ((actual, &value), blind) in masks
             .binding
-            .forms
-            .iter()
+            .evaluate(layout, &mask_message)
+            .into_iter()
             .zip(&masks.binding.values)
             .zip(blind_binding)
         {
-            verify!(form.evaluate(&Identity::new(), &mask_message) == blind + lambda * value);
+            verify!(actual == blind + lambda * value);
         }
         let sum = blind_sum + lambda * state.sum - masks.claims.evaluate(&mask_message);
         Ok((message, sum))
@@ -188,7 +188,7 @@ mod tests {
         algebra::{
             embedding::Basefield,
             fields::{Field64_2, Field64_3},
-            linear_form::{MultilinearExtension, UnivariateEvaluation},
+            linear_form::{Evaluate, MultilinearExtension, UnivariateEvaluation},
             random_vector,
         },
         buffer::{Buffer, BufferMath, BufferOps},

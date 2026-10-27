@@ -10,7 +10,7 @@ use tracing::instrument;
 use crate::{
     algebra::{
         embedding::{Embedding, Identity},
-        linear_form::{Evaluate, LinearForm},
+        linear_form::LinearForm,
     },
     buffer::{Buffer, BufferMath, BufferOps},
     hash::Hash,
@@ -134,8 +134,8 @@ impl<M: Embedding + Default> ProtocolConfig<M> {
         let blind_sum =
             witness_blinder.dot(&state.covector) + masks.claims.evaluate(mask_blinder.to_slice());
         ps.prover_message(&blind_sum);
-        for form in &masks.binding.forms {
-            ps.prover_message(&form.evaluate(&Identity::new(), mask_blinder.to_slice()));
+        for value in masks.binding.evaluate(layout, mask_blinder.to_slice()) {
+            ps.prover_message(&value);
         }
         let lambda = ps.verifier_message::<M::Target>();
         state
