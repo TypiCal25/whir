@@ -57,6 +57,42 @@ fn send_blinding_evals<F, H, R>(
     }
 }
 
+/// Send m̃ and ĝ_i evaluations at every point in `points`, in order.
+///
+/// Writes the same messages in the same order as calling
+/// [`send_blinding_evals`] once per point, so the transcript is unchanged. All
+/// evaluations are computed before any is written, in parallel across points,
+/// because each [`univariate_evaluate`] call on its own is too small to split
+/// well.
+///
+/// Used at STIR and Γ points, where no other message sits between points.
+fn send_blinding_evals_at_points<F, H, R>(
+    prover_state: &mut ProverState<H, R>,
+    points: &[F],
+    masking_coeffs_all: &[Vec<F>],
+    g_i_coeffs: &[Vec<F>],
+) where
+    F: FftField + Codec<[H::U]>,
+    H: DuplexSpongeInterface,
+    R: RngCore + CryptoRng,
+{
+    let evaluate_at = |&z: &F| -> Vec<F> {
+        masking_coeffs_all
+            .iter()
+            .chain(g_i_coeffs)
+            .map(|coeffs| coeffs.iter().rev().fold(F::ZERO, |acc, &c| acc * z + c))
+            .collect()
+    };
+    #[cfg(feature = "parallel")]
+    let evaluations: Vec<Vec<F>> = points.par_iter().map(evaluate_at).collect();
+    #[cfg(not(feature = "parallel"))]
+    let evaluations: Vec<Vec<F>> = points.iter().map(evaluate_at).collect();
+
+    for evaluation in evaluations.iter().flatten() {
+        prover_state.prover_message(evaluation);
+    }
+}
+
 /// Intermediate result from proving the blinded polynomial (Steps 2-6).
 ///
 /// Carries the values needed by Step 7 (blinding polynomial proof).
@@ -384,10 +420,13 @@ where
         drop(f_hat_polys);
 
         // --- STIR responses ---
-        for &z in &in_domain.points {
-            send_blinding_evals(self.prover_state, z, &masking_coeffs_all, &g_i_coeffs);
-            lambda_z_points.push(z);
-        }
+        send_blinding_evals_at_points(
+            self.prover_state,
+            &in_domain.points,
+            &masking_coeffs_all,
+            &g_i_coeffs,
+        );
+        lambda_z_points.extend_from_slice(&in_domain.points);
 
         Self::accumulate_stir_constraints(
             self.prover_state,
@@ -449,10 +488,13 @@ where
             .initial_committer
             .open_at_indices(self.prover_state, &[f_hat_witness], &gamma_f_hat_indices);
 
-        for &gamma in gamma_points {
-            send_blinding_evals(self.prover_state, gamma, masking_coeffs_all, g_i_coeffs);
-            lambda_z_points.push(gamma);
-        }
+        send_blinding_evals_at_points(
+            self.prover_state,
+            gamma_points,
+            masking_coeffs_all,
+            g_i_coeffs,
+        );
+        lambda_z_points.extend_from_slice(gamma_points);
     }
 }
 
@@ -672,5 +714,57 @@ impl<F: FftField> Config<F> {
             &blinding_poly_witness,
             &blinded,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ark_std::{
+        rand::{rngs::StdRng, SeedableRng},
+        UniformRand,
+    };
+
+    use super::{send_blinding_evals, send_blinding_evals_at_points};
+    use crate::{
+        algebra::fields::Field256,
+        transcript::{codecs::Empty, DomainSeparator, ProverState},
+    };
+
+    type F = Field256;
+
+    fn random_polynomials(rng: &mut StdRng, lengths: &[usize]) -> Vec<Vec<F>> {
+        lengths
+            .iter()
+            .map(|&length| (0..length).map(|_| F::rand(rng)).collect())
+            .collect()
+    }
+
+    /// The batched send must write exactly the transcript of one
+    /// `send_blinding_evals` call per point, for any number of points.
+    #[test]
+    fn batched_blinding_evals_match_per_point_transcript() {
+        let mut rng = StdRng::seed_from_u64(7);
+        let masking = random_polynomials(&mut rng, &[1 << 10, 1 << 10, 1 << 12, 1, 0]);
+        let g = random_polynomials(&mut rng, &[1 << 9, 3]);
+
+        for point_count in [0, 1, 2, 37, 200] {
+            let points: Vec<F> = (0..point_count).map(|_| F::rand(&mut rng)).collect();
+            let ds = DomainSeparator::protocol(&module_path!())
+                .session(&format!("Test at {}:{}", file!(), line!()))
+                .instance(&Empty);
+
+            let mut per_point = ProverState::new_std(&ds);
+            for &z in &points {
+                send_blinding_evals(&mut per_point, z, &masking, &g);
+            }
+            let mut batched = ProverState::new_std(&ds);
+            send_blinding_evals_at_points(&mut batched, &points, &masking, &g);
+
+            assert_eq!(
+                batched.proof().narg_string,
+                per_point.proof().narg_string,
+                "batched blinding evaluations changed the transcript for {point_count} points"
+            );
+        }
     }
 }
