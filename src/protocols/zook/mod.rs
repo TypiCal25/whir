@@ -3,6 +3,7 @@
 mod binding;
 mod claims;
 pub mod commit;
+mod joint;
 pub mod prover;
 mod round;
 pub mod verifier;

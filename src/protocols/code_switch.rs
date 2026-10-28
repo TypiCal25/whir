@@ -73,7 +73,7 @@ pub type Commitment = IrsCommitment;
 
 /// Code-switch aggregation weights and evaluation points.
 ///
-/// Returned in [`Witness::update`] and by [`Config::verify_for_implicit`].
+/// Returned in [`Witness::update`] and during verification.
 /// Callers use these to update implicit kernels and carried mask claims.
 #[must_use]
 #[derive(Clone, Debug)]
@@ -211,6 +211,32 @@ impl<M: Embedding> Config<M> {
         self.source.message_length() + self.message_mask_length()
     }
 
+    fn debug_assert_source_parameters(&self, committed_source: &IrsConfig<M>) {
+        // Separate commitments may have fewer columns, but must use the same
+        // polynomial lengths, evaluation domain, and query parameters.
+        debug_assert_eq!(
+            (
+                committed_source.num_vectors(),
+                committed_source.message_length(),
+                committed_source.mode(),
+                committed_source.codeword_length(),
+                committed_source.in_domain_samples(),
+                committed_source.deduplicate_in_domain(),
+                committed_source.regime(),
+            ),
+            (
+                self.source.num_vectors(),
+                self.source.message_length(),
+                self.source.mode(),
+                self.source.codeword_length(),
+                self.source.in_domain_samples(),
+                self.source.deduplicate_in_domain(),
+                self.source.regime(),
+            ),
+            "committed source polynomial and query parameters must match source"
+        );
+    }
+
     /// Prove the code-switch.
     ///
     /// # Soundness-critical inputs
@@ -231,12 +257,14 @@ impl<M: Embedding> Config<M> {
     /// `mask` is `(r || s)` from the orchestrator's shared mask tree
     /// (see Construction 9.7 Step 1, p.55). Length must equal
     /// `self.message_mask_length()` — pass an empty slice in Standard mode.
+    #[allow(clippy::too_many_arguments)]
     #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn prove<H, R>(
+    pub(crate) fn prove<H, R>(
         &self,
         prover_state: &mut ProverState<H, R>,
         message: Buffer<M::Target>,
-        witness: IrsWitness<M::Source>,
+        committed_source: &IrsConfig<M>,
+        witnesses: Vec<IrsWitness<M::Source>>,
         claim: Claim<'_, M::Target>,
         folding_randomness: &[M::Target],
         mask: &[M::Target],
@@ -251,6 +279,7 @@ impl<M: Embedding> Config<M> {
         U64: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
+        self.debug_assert_source_parameters(committed_source);
         let Claim { covector, sum } = claim;
         assert_eq!(message.len(), self.source.message_length());
         assert_eq!(covector.len(), self.covector_length());
@@ -274,10 +303,14 @@ impl<M: Embedding> Config<M> {
         let ood_answers = self.maybe_send_ood_answers(prover_state, &message, mask, &ood_points);
 
         // Step 4: in-domain queries — Construction 9.7 Step 4, p.55
-        let source_evaluations = self.source.open(prover_state, &[&witness]);
-        // Source IRS matrix is no longer needed; release it before the trailing
-        // arithmetic and the caller's mask-discharge phase.
-        drop(witness);
+        assert_eq!(
+            committed_source.interleaving_depth() * witnesses.len(),
+            self.source.interleaving_depth()
+        );
+        let witness_refs: Vec<_> = witnesses.iter().collect();
+        let source_evaluations = committed_source.open(prover_state, &witness_refs);
+        // Release both source matrices before the remaining arithmetic.
+        drop(witnesses);
         let collapse_weights = Buffer::<M::Target>::eq_weights(folding_randomness);
         let collapsed_values =
             source_evaluations.values_buffer(self.source.embedding(), &collapse_weights);
@@ -421,12 +454,14 @@ impl<M: Embedding> Config<M> {
     /// Shared transcript work: receive target commitment, verify source opening,
     /// sample batching coefficients, update `sum`. Returns the target commitment
     /// and the parameters needed to update a covector (explicitly or implicitly).
-    fn verify_inner<H>(
+    #[cfg_attr(feature = "tracing", instrument(skip_all))]
+    pub(crate) fn verify_for_implicit<H>(
         &self,
         verifier_state: &mut VerifierState<H>,
         sum: &mut M::Target,
         folding_randomness: &[M::Target],
-        commitment: &IrsCommitment,
+        committed_source: &IrsConfig<M>,
+        commitments: &[&IrsCommitment],
     ) -> VerificationResult<(Commitment, CovectorUpdateParams<M::Target>)>
     where
         H: DuplexSpongeInterface,
@@ -437,6 +472,17 @@ impl<M: Embedding> Config<M> {
         U64: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
+        self.debug_assert_source_parameters(committed_source);
+        verify!(
+            1usize.checked_shl(folding_randomness.len() as u32)
+                == Some(self.source.interleaving_depth())
+        );
+        verify!(
+            committed_source
+                .interleaving_depth()
+                .checked_mul(commitments.len())
+                == Some(self.source.interleaving_depth())
+        );
         let collapse_weights = eq_weights(folding_randomness);
 
         let target_commitment = self.target.receive_commitment(verifier_state)?;
@@ -447,7 +493,7 @@ impl<M: Embedding> Config<M> {
         let ood_answers: Vec<M::Target> =
             verifier_state.prover_messages_vec(self.out_domain_samples)?;
 
-        let source_evaluations = self.source.verify(verifier_state, &[commitment])?;
+        let source_evaluations = committed_source.verify(verifier_state, commitments)?;
         let collapsed_values: Vec<M::Target> = source_evaluations
             .matrix
             .to_slice()
@@ -498,11 +544,15 @@ impl<M: Embedding> Config<M> {
         U64: Codec<[H::U]>,
         Hash: ProverMessage<[H::U]>,
     {
-        verify!(1 << folding_randomness.len() == self.source.interleaving_depth());
         assert_eq!(covector.len(), self.covector_length());
 
-        let (target_commitment, params) =
-            self.verify_inner(verifier_state, sum, folding_randomness, commitment)?;
+        let (target_commitment, params) = self.verify_for_implicit(
+            verifier_state,
+            sum,
+            folding_randomness,
+            &self.source,
+            &[commitment],
+        )?;
 
         covector.scalar_mul(params.original_sl_coeff);
         let ood_rlc_coeffs = Buffer::from(params.ood_rlc_coeffs);
@@ -516,31 +566,6 @@ impl<M: Embedding> Config<M> {
         );
 
         Ok(target_commitment)
-    }
-
-    /// Like [`verify`] but does NOT update an explicit covector. Instead it
-    /// returns [`CovectorUpdateParams`] so the caller can accumulate constraint
-    /// terms implicitly. Also does NOT assert `covector.len() == covector_length()`
-    /// since there is no covector. The `sum` is still updated as normal.
-    #[cfg_attr(feature = "tracing", instrument(skip_all))]
-    pub fn verify_for_implicit<H>(
-        &self,
-        verifier_state: &mut VerifierState<H>,
-        sum: &mut M::Target,
-        folding_randomness: &[M::Target],
-        commitment: &IrsCommitment,
-    ) -> VerificationResult<(Commitment, CovectorUpdateParams<M::Target>)>
-    where
-        H: DuplexSpongeInterface,
-        Standard: Distribution<M::Target>,
-        M::Target: Codec<[H::U]>,
-        u8: Decoding<[H::U]>,
-        [u8; 32]: Decoding<[H::U]>,
-        U64: Codec<[H::U]>,
-        Hash: ProverMessage<[H::U]>,
-    {
-        verify!(1 << folding_randomness.len() == self.source.interleaving_depth());
-        self.verify_inner(verifier_state, sum, folding_randomness, commitment)
     }
 }
 
@@ -599,12 +624,26 @@ pub fn mixed_fold_chunks<M: Embedding>(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(debug_assertions)]
+    use std::panic::catch_unwind;
+
     use ark_std::rand::{
         distributions::Standard, prelude::Distribution, rngs::StdRng, Rng, SeedableRng,
     };
     use proptest::{bool, prelude::Strategy, prop_assume, proptest, sample::select};
 
     use super::*;
+    #[cfg(debug_assertions)]
+    use crate::{
+        algebra::fields::Field64,
+        hash::BLAKE3,
+        protocols::{
+            irs_commit::{IrsMode, IrsParams},
+            params::DecodingRegime,
+            proof_of_work::Config as PowConfig,
+        },
+        transcript::codecs::Empty,
+    };
     use crate::{
         algebra::{embedding::Identity, fields, ntt, random_vector},
         transcript::{codecs::U64, DomainSeparator},
@@ -775,7 +814,8 @@ mod tests {
         let witness = config.prove(
             &mut prover_state,
             folded_message_buffer,
-            source_witness,
+            &config.source,
+            vec![source_witness],
             Claim {
                 covector: &mut covector,
                 sum: &mut prover_sum,
@@ -851,7 +891,8 @@ mod tests {
         let _witness = config.prove(
             &mut prover_state,
             folded_message,
-            source_witness,
+            &config.source,
+            vec![source_witness],
             Claim {
                 covector: &mut covector,
                 sum: &mut prover_sum,
@@ -918,7 +959,8 @@ mod tests {
         let _witness = config.prove(
             &mut prover_state,
             tampered,
-            source_witness,
+            &config.source,
+            vec![source_witness],
             Claim {
                 covector: &mut covector,
                 sum: &mut prover_sum,
@@ -997,6 +1039,60 @@ mod tests {
     #[ignore = "Somewhat expensive and redundant"]
     fn test_field256() {
         test::<fields::Field256>();
+    }
+
+    #[cfg(debug_assertions)]
+    #[test]
+    fn mismatched_source_parameters_panic_before_transcript_reads() {
+        let params = IrsParams {
+            security_target: 128.0,
+            decoding_regime: DecodingRegime::Johnson,
+            hash_id: BLAKE3,
+            num_vectors: 1,
+            vector_size: 32,
+            interleaving_depth: 4,
+            rate: 0.25,
+            mode: IrsMode::Standard,
+        };
+        let source = IrsConfig::<Identity<Field64>>::new(params.clone());
+        let target = IrsConfig::new(IrsParams {
+            vector_size: source.message_length(),
+            interleaving_depth: 1,
+            ..params.clone()
+        });
+        let config = Config::new(
+            source,
+            target,
+            1,
+            CodeSwitchMode::Standard,
+            PowConfig::none(),
+        );
+        for (rate, fewer_queries) in [(0.125, false), (0.25, true)] {
+            let mut committed_source = IrsConfig::new(IrsParams {
+                rate,
+                ..params.clone()
+            });
+            committed_source.set_in_domain_samples_for_test(
+                config.source.in_domain_samples() - usize::from(fewer_queries),
+            );
+            let panic = catch_unwind(|| {
+                let ds = DomainSeparator::protocol(&config).instance(&Empty);
+                let proof = ProverState::new_std(&ds).proof();
+                let mut verifier = VerifierState::new_std(&ds, &proof);
+                let mut sum = Field64::ZERO;
+                let _ = config.verify_for_implicit(
+                    &mut verifier,
+                    &mut sum,
+                    &[Field64::ZERO; 2],
+                    &committed_source,
+                    &[&IrsCommitment::default()],
+                );
+            })
+            .expect_err("mismatched source parameters must panic in debug builds");
+            let message = panic.downcast_ref::<String>().unwrap();
+            assert!(message
+                .contains("committed source polynomial and query parameters must match source"));
+        }
     }
 
     #[test]

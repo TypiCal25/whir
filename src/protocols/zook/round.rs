@@ -551,7 +551,8 @@ where
     let switched = round.code_switch().prove(
         ps,
         message,
-        state.irs_witness,
+        round.code_switch().source(),
+        vec![state.irs_witness],
         Claim {
             covector: &mut state.covector,
             sum: &mut state.sum,
@@ -617,7 +618,8 @@ where
         vs,
         &mut state.sum,
         &opening.round_challenges,
-        &state.irs,
+        round.code_switch().source(),
+        &[&state.irs],
     )?;
     state.kernel.aggregate(&update);
     if let Some((masks, (layout, next_mask))) = state.masks.as_mut().zip(mask_plan) {
