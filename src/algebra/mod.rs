@@ -128,10 +128,26 @@ pub fn mixed_dot<F: Field, G: Field>(
         .sum()
 }
 
+/// Shortest half [`geometric_accumulate`] splits an accumulator into; below
+/// this, raising every point to the half's offset costs a large share of the
+/// half's own work.
+#[cfg(feature = "parallel")]
+const GEOMETRIC_MIN_SPLIT: usize = 64;
+
 /// Compute `accumulator[i] += sum_j scalars[j] * points[j]^i`
+///
+/// With the `parallel` feature and more than one thread, splits by total
+/// work, one multiplication per entry and point, so a short accumulator with
+/// many points is still spread over threads. The high half starts from
+/// `scalars[j] * points[j]^half`, so every entry receives the same values as
+/// in one sequential pass. On a single thread it never splits, since each
+/// split only adds the cost of those powers.
 pub fn geometric_accumulate<F: Field>(accumulator: &mut [F], mut scalars: Vec<F>, points: &[F]) {
     #[cfg(feature = "parallel")]
-    if accumulator.len() > workload_size::<F>() {
+    if rayon::current_num_threads() > 1
+        && accumulator.len() >= 2 * GEOMETRIC_MIN_SPLIT
+        && accumulator.len().saturating_mul(points.len()) > workload_size::<F>()
+    {
         let half = accumulator.len() / 2;
         let (low, high) = accumulator.split_at_mut(half);
         let scalars_high = scalars
@@ -150,6 +166,73 @@ pub fn geometric_accumulate<F: Field>(accumulator: &mut [F], mut scalars: Vec<F>
         for (scalar, point) in scalars.iter_mut().zip(points) {
             *entry += *scalar;
             *scalar *= *point; // TODO: Skip on last
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::geometric_accumulate;
+    use crate::algebra::fields::Field64;
+
+    /// SplitMix64 over Field64, so the inputs are reproducible.
+    fn random_elements(state: &mut u64, count: usize) -> Vec<Field64> {
+        (0..count)
+            .map(|_| {
+                *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = *state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                Field64::from(z ^ (z >> 31))
+            })
+            .collect()
+    }
+
+    /// However it splits the accumulator, geometric_accumulate must give every
+    /// entry exactly the values of one sequential pass.
+    #[test]
+    fn geometric_accumulate_matches_sequential_pass() {
+        let mut state = 0x6e0_u64;
+        for length in [0, 1, 2, 63, 64, 127, 128, 129, 1000, 5000, 9000] {
+            for num_points in [0, 1, 3, 190] {
+                let initial = random_elements(&mut state, length);
+                let scalars = random_elements(&mut state, num_points);
+                let points = random_elements(&mut state, num_points);
+
+                let mut expected = initial.clone();
+                let mut running = scalars.clone();
+                for entry in &mut expected {
+                    for (scalar, point) in running.iter_mut().zip(&points) {
+                        *entry += *scalar;
+                        *scalar *= *point;
+                    }
+                }
+
+                #[cfg(feature = "parallel")]
+                {
+                    let mut single_thread = initial.clone();
+                    rayon::ThreadPoolBuilder::new()
+                        .num_threads(1)
+                        .build()
+                        .expect("a one-thread pool must build")
+                        .install(|| {
+                            geometric_accumulate(&mut single_thread, scalars.clone(), &points);
+                        });
+                    assert_eq!(
+                        single_thread, expected,
+                        "single-threaded geometric_accumulate differs from a sequential pass \
+                         for {length} entries and {num_points} points"
+                    );
+                }
+
+                let mut actual = initial;
+                geometric_accumulate(&mut actual, scalars, &points);
+                assert_eq!(
+                    actual, expected,
+                    "geometric_accumulate differs from a sequential pass for {length} entries \
+                     and {num_points} points"
+                );
+            }
         }
     }
 }

@@ -1,4 +1,6 @@
 use ark_ff::FftField;
+#[cfg(feature = "parallel")]
+use rayon::prelude::*;
 
 use super::Config;
 use crate::algebra::{geometric_accumulate, geometric_sequence};
@@ -209,7 +211,7 @@ pub(super) fn build_beq_tables<F: FftField>(
     let num_points = lambda_z_points.len();
     let mut tables = vec![vec![F::ZERO; half_size]; num_g_polys];
 
-    for (i, table) in tables.iter_mut().enumerate() {
+    let build_table = |(i, table): (usize, &mut Vec<F>)| {
         let start_i = if i == 0 { 0 } else { (i - 1) * ell + rem };
 
         // Bit-window decomposition relative to c|m boundary at position num_folding_vars
@@ -273,7 +275,13 @@ pub(super) fn build_beq_tables<F: FftField>(
         } else {
             *table = m_inner;
         }
-    }
+    };
+    // Each table depends only on shared inputs, never on another table, so
+    // building them in parallel produces exactly the same tables.
+    #[cfg(feature = "parallel")]
+    tables.par_iter_mut().enumerate().for_each(build_table);
+    #[cfg(not(feature = "parallel"))]
+    tables.iter_mut().enumerate().for_each(build_table);
 
     tables
 }
@@ -331,27 +339,18 @@ pub(super) fn compute_rs_fold_blinding_coeffs<F: FftField>(
     let num_masking = masking_polys.len();
     let neg_rho = -rho;
 
-    // Accumulate g₀ fold coeffs, per-masking fold coeffs, and g_i fold coeffs
-    #[allow(clippy::needless_range_loop)]
-    let accumulate_j = |g0_fold_accumulator: &mut Vec<F>,
-                        masking_fold_accumulators: &mut Vec<Vec<F>>,
-                        g_polys_fold_accumulator: &mut Vec<Vec<F>>,
-                        j: usize| {
-        let eq_j = eq_weights[j];
-        for sub_idx in 0..sub_poly_len {
-            let full_idx = j * sub_poly_len + sub_idx;
-            let phi_0_idx = dims.phi_i_bits(full_idx, 0);
-
-            g0_fold_accumulator[sub_idx] += eq_j * g_polys[0][phi_0_idx];
-            for (i, msk) in masking_polys.iter().enumerate() {
-                masking_fold_accumulators[i][sub_idx] += eq_j * msk[phi_0_idx];
-            }
-
-            for (gi_idx, g_poly) in g_polys[1..].iter().enumerate() {
-                let phi_i_idx = dims.phi_i_bits(full_idx, gi_idx + 1);
-                g_polys_fold_accumulator[gi_idx][sub_idx] += eq_j * g_poly[phi_i_idx];
+    // Fold one polynomial through Φ_phi: g₀ and every masking polynomial use
+    // Φ₀, and ĝᵢ uses Φᵢ. Each coefficient sums over the sub-polynomials j in
+    // ascending order.
+    let fold = |poly: &[F], phi: usize| -> Vec<F> {
+        let mut folded = vec![F::ZERO; sub_poly_len];
+        for (j, &eq_j) in eq_weights.iter().enumerate().take(num_sub_polys) {
+            for (sub_idx, coefficient) in folded.iter_mut().enumerate() {
+                let full_idx = j * sub_poly_len + sub_idx;
+                *coefficient += eq_j * poly[dims.phi_i_bits(full_idx, phi)];
             }
         }
+        folded
     };
 
     // Assemble masking_coeffs_all from raw g₀ fold and masking folds
@@ -377,12 +376,30 @@ pub(super) fn compute_rs_fold_blinding_coeffs<F: FftField>(
             }
         };
 
-    let mut g0_fold = vec![F::ZERO; sub_poly_len];
-    let mut masking_folds = vec![vec![F::ZERO; sub_poly_len]; num_masking];
-    let mut g_i_coeffs = vec![vec![F::ZERO; sub_poly_len]; num_g_polys - 1];
-    for j in 0..num_sub_polys {
-        accumulate_j(&mut g0_fold, &mut masking_folds, &mut g_i_coeffs, j);
-    }
+    // Every fold reads only the shared inputs and runs its sums in the same
+    // order as when all of them were accumulated in one loop, so folding the
+    // polynomials in parallel produces exactly the same coefficients.
+    let sources: Vec<(&[F], usize)> = std::iter::once((g_polys[0].as_slice(), 0))
+        .chain(masking_polys.iter().map(|msk| (msk.as_slice(), 0)))
+        .chain(
+            g_polys[1..]
+                .iter()
+                .enumerate()
+                .map(|(gi_idx, g_poly)| (g_poly.as_slice(), gi_idx + 1)),
+        )
+        .collect();
+    #[cfg(feature = "parallel")]
+    let mut folds: Vec<Vec<F>> = sources
+        .par_iter()
+        .map(|&(poly, phi)| fold(poly, phi))
+        .collect();
+    #[cfg(not(feature = "parallel"))]
+    let mut folds: Vec<Vec<F>> = sources.iter().map(|&(poly, phi)| fold(poly, phi)).collect();
+
+    let g_i_coeffs = folds.split_off(1 + num_masking);
+    let masking_folds = folds.split_off(1);
+    let g0_fold = folds.pop().expect("the g₀ fold is always computed");
+    debug_assert_eq!(g_i_coeffs.len(), num_g_polys - 1);
 
     assemble(g0_fold, masking_folds, g_i_coeffs)
 }
@@ -549,7 +566,7 @@ impl<F> LambdaAccumulator<F> {
 
 #[cfg(test)]
 mod tests {
-    use ark_ff::{FftField, Field};
+    use ark_ff::{AdditiveGroup, FftField, Field};
     use proptest::prelude::*;
 
     use super::{discrete_log_pow2, phi_i_bits};
@@ -837,6 +854,125 @@ mod tests {
             prop_assert_eq!(
                 reconstructed, b,
                 "partition reconstruction failed for b={:#b}, mu={}, ell={}", b, mu, ell
+            );
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // compute_rs_fold_blinding_coeffs against the single-loop original
+    // ---------------------------------------------------------------
+
+    /// The single-loop fold `compute_rs_fold_blinding_coeffs` replaced, kept
+    /// as the reference: every output accumulated together, sub-polynomial by
+    /// sub-polynomial. Returns (masking_coeffs_all, g_i_coeffs).
+    fn rs_fold_reference(
+        eq_weights: &[Field64],
+        g_polys: &[Vec<Field64>],
+        masking_polys: &[Vec<Field64>],
+        alpha_coeffs: &[Field64],
+        rho: Field64,
+        dims: super::ProtocolDims,
+    ) -> (Vec<Vec<Field64>>, Vec<Vec<Field64>>) {
+        let num_sub_polys = eq_weights.len();
+        let sub_poly_len = 1usize << (dims.mu - num_sub_polys.trailing_zeros() as usize);
+        let mut g0_fold = vec![Field64::ZERO; sub_poly_len];
+        let mut masking_folds = vec![vec![Field64::ZERO; sub_poly_len]; masking_polys.len()];
+        let mut g_i_coeffs = vec![vec![Field64::ZERO; sub_poly_len]; g_polys.len() - 1];
+        for (j, &eq_j) in eq_weights.iter().enumerate() {
+            for sub_idx in 0..sub_poly_len {
+                let full_idx = j * sub_poly_len + sub_idx;
+                let phi_0_idx = dims.phi_i_bits(full_idx, 0);
+                g0_fold[sub_idx] += eq_j * g_polys[0][phi_0_idx];
+                for (i, msk) in masking_polys.iter().enumerate() {
+                    masking_folds[i][sub_idx] += eq_j * msk[phi_0_idx];
+                }
+                for (gi_idx, g_poly) in g_polys[1..].iter().enumerate() {
+                    let phi_i_idx = dims.phi_i_bits(full_idx, gi_idx + 1);
+                    g_i_coeffs[gi_idx][sub_idx] += eq_j * g_poly[phi_i_idx];
+                }
+            }
+        }
+        let neg_rho = -rho;
+        let mut masking_coeffs_all: Vec<Vec<Field64>> = vec![g0_fold
+            .iter()
+            .zip(&masking_folds[0])
+            .map(|(&g, &msk)| g + neg_rho * msk)
+            .collect()];
+        for i in 1..masking_polys.len() {
+            let scale = neg_rho * alpha_coeffs[i];
+            masking_coeffs_all.push(masking_folds[i].iter().map(|&v| scale * v).collect());
+        }
+        (masking_coeffs_all, g_i_coeffs)
+    }
+
+    /// SplitMix64 over Field64, so the inputs are reproducible.
+    fn random_elements(state: &mut u64, count: usize) -> Vec<Field64> {
+        (0..count)
+            .map(|_| {
+                *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut z = *state;
+                z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                Field64::from(z ^ (z >> 31))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn rs_fold_blinding_coeffs_match_single_loop_reference() {
+        let mut state = 0xf01d_u64;
+        // (mu, ell, nu, num_vectors, folding variables)
+        for (mu, ell, nu, num_vectors, folding_vars) in [
+            (8, 3, 2, 1, 3),
+            (8, 3, 2, 2, 1),
+            (10, 3, 3, 3, 2),
+            (9, 3, 3, 1, 0),
+            (12, 4, 2, 2, 4),
+        ] {
+            let dims = super::ProtocolDims {
+                mu,
+                ell,
+                rem: mu % ell,
+                nu,
+                size: 1 << mu,
+                num_vectors,
+                num_blinding_vecs: nu + num_vectors,
+            };
+            let eq_weights = random_elements(&mut state, 1 << folding_vars);
+            let g_polys: Vec<Vec<Field64>> = (0..=nu)
+                .map(|_| random_elements(&mut state, 1 << ell))
+                .collect();
+            let masking_polys: Vec<Vec<Field64>> = (0..num_vectors)
+                .map(|_| random_elements(&mut state, 1 << ell))
+                .collect();
+            let alpha_coeffs = random_elements(&mut state, num_vectors);
+            let rho = random_elements(&mut state, 1)[0];
+
+            let folded = super::compute_rs_fold_blinding_coeffs(
+                &eq_weights,
+                &g_polys,
+                &masking_polys,
+                &alpha_coeffs,
+                rho,
+                dims,
+            );
+            let (masking_reference, g_i_reference) = rs_fold_reference(
+                &eq_weights,
+                &g_polys,
+                &masking_polys,
+                &alpha_coeffs,
+                rho,
+                dims,
+            );
+            assert_eq!(
+                folded.masking_coeffs_all, masking_reference,
+                "masking fold coefficients differ from the single-loop fold for mu={mu}, \
+                 ell={ell}, nu={nu}, {num_vectors} vectors, {folding_vars} folding variables"
+            );
+            assert_eq!(
+                folded.g_i_coeffs, g_i_reference,
+                "g_i fold coefficients differ from the single-loop fold for mu={mu}, ell={ell}, \
+                 nu={nu}, {num_vectors} vectors, {folding_vars} folding variables"
             );
         }
     }
